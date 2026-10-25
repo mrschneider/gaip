@@ -20,10 +20,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build (the client integration test spawns the engine binary;
+          experiments need the debug binaries)
+        run: cargo build --workspace
       - name: Tests
         run: cargo test --workspace
-      - name: Build (experiments need the debug binaries)
-        run: cargo build --workspace
       - name: GIOP layer E2E
         run: python3 experiments/experiment_001_giop_layer.py
       - name: Broker E2E
