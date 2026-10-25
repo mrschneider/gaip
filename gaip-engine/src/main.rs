@@ -330,7 +330,7 @@ fn main() {
             recorder: shared_recorder.clone(),
             locks: shared_locks.clone(),
             events: shared_events.clone(),
-            credits: Arc::new(std::sync::atomic::AtomicI64::new(2)),
+            credits: Arc::new(std::sync::atomic::AtomicI64::new(16)),
         });
         let n = i + 1;
         std::thread::spawn(move || {

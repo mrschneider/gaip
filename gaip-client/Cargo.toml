@@ -16,5 +16,5 @@ sha2 = { workspace = true }
 [dev-dependencies]
 hmac = { workspace = true }
 sha2 = { workspace = true }
-digest = "0.10"
-crypto-common = "0.1"
+digest = "0.11"
+crypto-common = "0.2"

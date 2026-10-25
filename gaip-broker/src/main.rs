@@ -68,6 +68,11 @@ struct Broker {
     failovers: BTreeMap<String, Vec<String>>,
     /// persisted bindings: the registry survives a broker restart
     registry_path: Option<PathBuf>,
+    /// graceful shutdown: set by the signal handler, checked by the
+    /// accept loop
+    draining: std::sync::atomic::AtomicBool,
+    /// completed exchanges checkpointed across a restart
+    state_path: Option<PathBuf>,
 }
 
 impl Broker {
@@ -115,6 +120,7 @@ fn main() {
     let mut urn = "urn:agent:gaip:broker:b1".to_string();
     let mut peers: Vec<String> = Vec::new();
     let mut registry_path: Option<PathBuf> = None;
+    let mut state_path: Option<PathBuf> = None;
     let mut retries = 3u32;
     let mut backoff_ms = 100u64;
 
@@ -125,6 +131,7 @@ fn main() {
             "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(port),
             "--urn" => urn = args.next().unwrap_or(urn),
             "--registry" => registry_path = args.next().map(PathBuf::from),
+            "--state" => state_path = args.next().map(PathBuf::from),
             "--peer" => {
                 if let Some(p) = args.next() {
                     peers.push(p);
@@ -173,10 +180,33 @@ fn main() {
         backoff_ms,
         failovers: BTreeMap::new(),
         registry_path: registry_path.clone(),
+        draining: std::sync::atomic::AtomicBool::new(false),
+        state_path: state_path.clone(),
     }));
     if let Some(path) = &registry_path {
         broker.lock().unwrap().load_registry(path);
         eprintln!("[broker] registry loaded from {}", path.display());
+    }
+    // GRACEFUL SHUTDOWN: SIGTERM/SIGINT set the drain flag and checkpoint
+    // the broker's memory so a restart neither re-executes completed
+    // exchanges nor forgets them
+    {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+            signal_hook::flag::register(sig, flag.clone()).ok();
+        }
+        let b = broker.clone();
+        std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            eprintln!("[broker] signal received: draining");
+            b.lock()
+                .unwrap()
+                .draining
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            b.lock().unwrap().checkpoint();
+        });
     }
 
     // connect to peer brokers (retry: a peer may start a moment later)
@@ -212,7 +242,17 @@ fn main() {
         }
     }
 
-    for stream in listener.incoming().flatten() {
+    for stream in listener
+        .incoming()
+        .take_while(|_| {
+            !broker
+                .lock()
+                .unwrap()
+                .draining
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .flatten()
+    {
         let _ = stream.set_nodelay(true);
         let out = match stream.try_clone() {
             Ok(s) => Arc::new(Outbox::spawn(s, 1024)),
@@ -607,6 +647,30 @@ impl Broker {
                 .unwrap_or(0),
         );
         eprintln!("[broker] dead letter #{total}: {sender} -> {target} at {latest}");
+    }
+
+    fn checkpoint(&self) {
+        let Some(path) = &self.state_path else { return };
+        let now = std::time::Instant::now();
+        let rows: Vec<serde_json::Value> = self
+            .dedupe
+            .snapshot(now)
+            .into_iter()
+            .map(|(sender, msg_id, left_ms, reply)| {
+                json!({"sender": sender, "message_id": msg_id, "left_ms": left_ms,
+                       "reply": serde_json::to_string(&reply).unwrap_or_default()})
+            })
+            .collect();
+        let doc = json!({"version": 1, "dedupe": rows, "failovers": self.failovers});
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, doc.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+            eprintln!(
+                "[broker] checkpoint: {} completed exchanges -> {}",
+                rows.len(),
+                path.display()
+            );
+        }
     }
 
     fn persist_registry(&self, path: &std::path::Path) {

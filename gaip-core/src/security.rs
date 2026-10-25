@@ -22,6 +22,7 @@ use crate::context::now_ms;
 use crate::context::{id, ServiceContext};
 use crate::error::GaipError;
 use crate::message::ReplyStatus;
+use digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 

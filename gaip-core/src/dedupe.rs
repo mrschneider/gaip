@@ -109,6 +109,45 @@ impl DedupeCache {
     }
 
     /// Drop expired entries (called from the heartbeat/sweep path).
+    /// Snapshot for a checkpoint. `now` anchors the TTLs: each entry is
+    /// stored with the milliseconds it still has to live, so a restore
+    /// keeps the window honest instead of resetting it.
+    pub fn snapshot(&self, now: Instant) -> Vec<(String, String, u128, WireMessage)> {
+        self.entries
+            .iter()
+            .filter_map(|((sender, msg_id), r)| {
+                let left = now.duration_since(r.stored_at);
+                let left_ms = self.ttl.as_millis().saturating_sub(left.as_millis());
+                if left_ms == 0 {
+                    return None;
+                }
+                Some((sender.clone(), msg_id.clone(), left_ms, r.reply.clone()))
+            })
+            .collect()
+    }
+
+    /// Restore a checkpoint taken by [`Self::snapshot`].
+    pub fn restore(&mut self, now: Instant, rows: Vec<(String, String, u128, WireMessage)>) {
+        for (sender, msg_id, left_ms, reply) in rows {
+            if self.entries.len() >= self.capacity {
+                break;
+            }
+            let key = (sender.clone(), msg_id.clone());
+            self.entries.insert(
+                key.clone(),
+                Remembered {
+                    reply,
+                    stored_at: now
+                        .checked_sub(Duration::from_millis(
+                            (self.ttl.as_millis().saturating_sub(left_ms)) as u64,
+                        ))
+                        .unwrap_or(now),
+                },
+            );
+            self.order.push_back(key);
+        }
+    }
+
     pub fn sweep(&mut self, now: Instant) -> usize {
         let before = self.entries.len();
         self.order.retain(|k| {
@@ -199,5 +238,51 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::envelope::Envelope;
+    use std::time::Duration;
+
+    fn reply(msg_id: &str) -> WireMessage {
+        WireMessage::reply(
+            1,
+            Envelope::new(
+                msg_id.to_string(),
+                "t".to_string(),
+                "urn:agent:a:x:y".to_string(),
+                "urn:agent:b:x:y".to_string(),
+                crate::envelope::MessageType::TaskReply,
+                serde_json::json!({"status": "OK"}),
+            ),
+        )
+    }
+
+    #[test]
+    fn a_checkpoint_restores_the_window_honestly() {
+        let now = Instant::now();
+        let mut c = DedupeCache::new(8, Duration::from_secs(120));
+        c.remember("urn:agent:a:x:y", "m1", reply("r1"));
+        let rows = c.snapshot(now);
+        assert_eq!(rows.len(), 1);
+
+        // restore into a FRESH cache, as a restart would
+        let mut c2 = DedupeCache::new(8, Duration::from_secs(120));
+        c2.restore(now, rows);
+        let hit = c2.lookup("urn:agent:a:x:y", "m1");
+        assert!(hit.is_some(), "a restored exchange replays identically");
+    }
+
+    #[test]
+    fn an_expired_row_is_not_checkpointed() {
+        let now = Instant::now();
+        let mut c = DedupeCache::new(8, Duration::from_millis(50));
+        c.remember("urn:agent:a:x:y", "m1", reply("r1"));
+        std::thread::sleep(Duration::from_millis(80));
+        let rows = c.snapshot(Instant::now());
+        assert!(rows.is_empty(), "a dead entry does not survive the restart");
     }
 }
