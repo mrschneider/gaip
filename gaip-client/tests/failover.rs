@@ -7,7 +7,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 fn identity_token(subject: &str, roles: &[&str]) -> String {
-    use digest::KeyInit;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let expires = std::time::SystemTime::now()
@@ -138,6 +137,7 @@ fn a_dead_endpoint_fails_over_and_the_cursor_survives_the_reconnect() {
     // the primary dies — the same client walks the plan to the alternate
     let pid = a.id();
     let killed = a.kill().is_ok();
+    let _ = a.wait();
     eprintln!("[test] engine A pid={pid} killed={killed}");
     wait_down(7821);
     eprintln!("[test] port 7821 is down");
