@@ -24,6 +24,8 @@ pub mod id {
     pub const IDENTITY: u16 = 0x0004;
     pub const ATTEMPT: u16 = 0x0005;
     pub const ROUTE: u16 = 0x0006;
+    /// comma-separated failover endpoints for the sending participant
+    pub const FAILOVER: u16 = 0x0007;
 }
 
 /// One context entry. `data` is opaque to the protocol; GAIP encodes it

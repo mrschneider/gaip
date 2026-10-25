@@ -266,3 +266,95 @@ mod tests {
         assert!(err.to_string().contains("IOR:"), "{err}");
     }
 }
+
+/// `corbaname:` — resolve through the naming service in one step.
+///
+/// `corbaname:gaip@host:port/<naming-path>#<binding-key>` addresses a
+/// NAMING SERVICE, not an object: the client first resolves the naming
+/// context at `host:port`, then looks up `<path>#<key>` inside it. The
+/// INS rule, kept: the part before `#` is a corbaloc for the naming
+/// service itself, the part after is the lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Corbaname {
+    /// where the naming service lives
+    pub naming: Ior,
+    /// the binding key to look up inside it
+    pub key: String,
+}
+
+impl Corbaname {
+    pub fn parse(s: &str) -> Result<Self, GaipError> {
+        let rest = s
+            .strip_prefix("corbaname:gaip@")
+            .ok_or_else(|| GaipError::BadUrn {
+                value: s.to_string(),
+                why: "expected corbaname:gaip@host:port/<path>#<key>".to_string(),
+            })?;
+        let (addr_and_path, key) = rest.split_once('#').ok_or_else(|| GaipError::BadUrn {
+            value: s.to_string(),
+            why: "missing '#<key>' lookup part".to_string(),
+        })?;
+        if key.is_empty() {
+            return Err(GaipError::BadUrn {
+                value: s.to_string(),
+                why: "empty lookup key".to_string(),
+            });
+        }
+        // the naming path becomes the naming service's URN; the key is
+        // what the client asks that service to resolve
+        let (host_part, path) = addr_and_path
+            .split_once('/')
+            .ok_or_else(|| GaipError::BadUrn {
+                value: s.to_string(),
+                why: "missing '/<naming-path>'".to_string(),
+            })?;
+        if path.is_empty() {
+            return Err(GaipError::BadUrn {
+                value: s.to_string(),
+                why: "empty naming path".to_string(),
+            });
+        }
+        let naming_urn = format!("urn:agent:gaip:naming:{path}");
+        let naming = Ior::new(naming_urn, vec![host_part.to_string()], "1.0");
+        naming.validate()?;
+        Ok(Self {
+            naming,
+            key: key.to_string(),
+        })
+    }
+
+    /// The corbaloc a client would dial to reach the naming service.
+    pub fn to_corbaloc(&self) -> String {
+        self.naming.to_corbaloc()
+    }
+}
+
+#[cfg(test)]
+mod corbaname_tests {
+    use super::*;
+
+    #[test]
+    fn a_corbaname_splits_into_naming_reference_and_lookup_key() {
+        let c = Corbaname::parse("corbaname:gaip@10.0.0.7:7620/swarm#backend/engine-1").unwrap();
+        assert_eq!(c.naming.urn, "urn:agent:gaip:naming:swarm");
+        assert_eq!(c.naming.endpoints, vec!["10.0.0.7:7620".to_string()]);
+        assert_eq!(c.key, "backend/engine-1");
+        assert_eq!(
+            c.to_corbaloc(),
+            "corbaloc:gaip@10.0.0.7:7620/urn:agent:gaip:naming:swarm"
+        );
+    }
+
+    #[test]
+    fn malformed_corbanames_are_named() {
+        for (bad, needle) in [
+            ("corbaname:gaip@h:1/swarm", "#"),
+            ("corbaname:gaip@h:1/swarm#", "empty lookup key"),
+            ("corbaname:gaip@h:1#key", "naming-path"),
+            ("ior:urn=…", "corbaname:gaip@"),
+        ] {
+            let err = Corbaname::parse(bad).unwrap_err().to_string();
+            assert!(err.contains(needle), "{bad:?} -> {err}");
+        }
+    }
+}

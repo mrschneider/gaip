@@ -19,3 +19,17 @@ intent DEMAND_FORECAST version 1.0 {
 intent FETCH_CONTEXT version 1.0 {
   key: string
 }
+
+intent LOCK_ACQUIRE version 1.0 {
+  resource: string
+  ttl_ms: int?
+  mode: string?
+}
+
+intent LOCK_RELEASE version 1.0 {
+  resource: string
+}
+
+intent EVENT_PULL version 1.0 {
+  after_seq: int?
+}

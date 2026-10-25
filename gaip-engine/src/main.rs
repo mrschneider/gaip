@@ -17,6 +17,7 @@ use gaip_core::codec::{decode_wire, encode_wire};
 use gaip_core::context::{now_ms, ContextList, ServiceContext};
 use gaip_core::flow::Outbox;
 use gaip_core::idl::InterfaceRepository;
+use gaip_core::interceptor::ServerInterceptor;
 use gaip_core::lifecycle::TaskRegistry;
 use gaip_core::message::{LocateStatus, ReplyStatus, SystemMinor, WireMessage};
 use gaip_core::policy::Policies;
@@ -69,6 +70,12 @@ struct Peer {
     next_msg: AtomicU64,
     /// simulated relocation target answered with OBJECT_FORWARD
     forward_to: Ior,
+    /// portable interceptors: the hooks every request/reply crosses
+    recorder: Arc<gaip_core::interceptor::Recorder>,
+    /// named locks with leases (CosConcurrency-lite), process-wide
+    locks: Arc<Mutex<gaip_core::locks::LockSet>>,
+    /// run telemetry with QoS (CosNotification-lite), process-wide
+    events: Arc<Mutex<gaip_core::events::EventChannel>>,
 }
 
 impl Peer {
@@ -110,6 +117,13 @@ impl Peer {
     }
 
     fn reply(&self, request_id: u32, status: ReplyStatus, body: Option<Envelope>) {
+        // interceptor: after the reply exists, before it is written
+        match &status {
+            ReplyStatus::SystemException { .. } => {
+                self.recorder.receive_exception(request_id, &status);
+            }
+            _ => self.recorder.send_reply(request_id, &status, body.as_ref()),
+        }
         let msg = WireMessage::Reply {
             request_id,
             status,
@@ -134,6 +148,7 @@ fn main() {
     let mut fragment_size = 64 * 1024usize;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut stats_interval: u64 = 0;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -144,6 +159,9 @@ fn main() {
             "--idl" => idl_path = args.next().unwrap_or(idl_path),
             "--key" => key = args.next().unwrap_or(key),
             "--tls-cert" => tls_cert = args.next(),
+            "--stats-interval" => {
+                stats_interval = args.next().and_then(|p| p.parse().ok()).unwrap_or(0)
+            }
             "--tls-key" => tls_key = args.next(),
             "--fragment-size" => {
                 fragment_size = args
@@ -220,6 +238,24 @@ fn main() {
         ir.len()
     );
 
+    // STATUS SURFACE: the recorder is process-wide (shared across peer
+    // threads), and --stats-interval prints it — measurements, not guesses
+    let shared_recorder = Arc::new(gaip_core::interceptor::Recorder::default());
+    let shared_locks = Arc::new(Mutex::new(gaip_core::locks::LockSet::new()));
+    let shared_events = Arc::new(Mutex::new(gaip_core::events::EventChannel::new(
+        gaip_core::events::Qos {
+            max_events: 256,
+            discard: gaip_core::events::Discard::Oldest,
+        },
+    )));
+    if stats_interval > 0 {
+        let rec = shared_recorder.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(stats_interval));
+            let (req, rep, exc) = rec.snapshot();
+            eprintln!("[engine stats] requests={req} replies={rep} exceptions={exc}");
+        });
+    }
     eprintln!(
         "[engine] transport: {}",
         if tls.is_some() {
@@ -268,6 +304,9 @@ fn main() {
                 "1.0",
             )
             .with_capabilities(vec!["INVENTORY_OPTIMIZATION".to_string()]),
+            recorder: shared_recorder.clone(),
+            locks: shared_locks.clone(),
+            events: shared_events.clone(),
         });
         let n = i + 1;
         std::thread::spawn(move || {
@@ -446,6 +485,24 @@ fn dispatch(peer: &Arc<Peer>, msg: WireMessage) -> bool {
 fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContext>, env: Envelope) {
     let mut ctx = ContextList::from_vec(contexts);
     ctx.push_route("engine-v1");
+    // interceptor: before dispatch, with the right to annotate the context
+    peer.recorder.receive_request(&mut ctx, &env);
+    // the run telemetry channel: task starts and outcomes are events with
+    // QoS, never silent drops
+    if env.message_type == MessageType::TaskRequest {
+        let mut ev = peer.events.lock().unwrap();
+        let _ = ev.publish(
+            "task_started",
+            serde_json::json!({
+                "correlation_id": env.correlation_id,
+                "intent": env.payload.get("intent").and_then(Value::as_str).unwrap_or(""),
+            }),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        );
+    }
 
     // POLICY: a deadline that already passed refuses the work
     if let Some(status) = peer.policies.check_deadline(&ctx) {
@@ -523,6 +580,110 @@ fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContex
             );
             return;
         }
+    }
+
+    // OPERATIONAL INTENTS: locks and event pulls are answered inline —
+    // they are not tasks and must not enter the lifecycle registry
+    let intent = env
+        .payload
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match intent.as_str() {
+        "LOCK_ACQUIRE" => {
+            let resource = env
+                .payload
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let ttl = env
+                .payload
+                .get("ttl_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(30_000);
+            let mode = env
+                .payload
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("write")
+                .to_string();
+            let granted = {
+                let mut locks = peer.locks.lock().unwrap();
+                if mode == "read" {
+                    locks.acquire_read(&env.sender, ttl)
+                } else {
+                    locks.acquire_write(&env.sender, ttl)
+                }
+            };
+            if !granted {
+                peer.reply(
+                    request_id,
+                    ReplyStatus::user(
+                        "E_LOCKED",
+                        format!("{resource} is locked by another holder"),
+                    ),
+                    None,
+                );
+                return;
+            }
+            peer.reply_ok(
+                request_id,
+                env.reply_to(
+                    peer.msg_id("msg"),
+                    json!({"intent": "LOCK_ACQUIRE", "resource": resource,
+                           "granted": true, "holder": env.sender, "ttl_ms": ttl}),
+                ),
+            );
+            return;
+        }
+        "LOCK_RELEASE" => {
+            let resource = env
+                .payload
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let released = {
+                let mut locks = peer.locks.lock().unwrap();
+                locks.release(&env.sender)
+            };
+            peer.reply_ok(
+                request_id,
+                env.reply_to(
+                    peer.msg_id("msg"),
+                    json!({"intent": "LOCK_RELEASE", "resource": resource, "released": released}),
+                ),
+            );
+            return;
+        }
+        "EVENT_PULL" => {
+            let after = env
+                .payload
+                .get("after_seq")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let (events, batch) = {
+                let ev = peer.events.lock().unwrap();
+                ev.drain_after(after)
+            };
+            peer.reply_ok(
+                request_id,
+                env.reply_to(
+                    peer.msg_id("msg"),
+                    json!({
+                        "intent": "EVENT_PULL",
+                        "events": events.iter().map(|e| json!({
+                            "seq": e.seq, "kind": e.kind, "body": e.body, "at_ms": e.at_ms,
+                        })).collect::<Vec<_>>(),
+                        "last_seq": batch.last_seq, "gap": batch.gap,
+                    }),
+                ),
+            );
+            return;
+        }
+        _ => {}
     }
 
     {

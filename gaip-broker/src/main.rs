@@ -28,9 +28,11 @@ use gaip_core::dedupe::DedupeCache;
 use gaip_core::flow::{FlowError, Outbox};
 use gaip_core::message::{ReplyStatus, SystemMinor, WireMessage};
 use gaip_core::Envelope;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +57,12 @@ struct Broker {
     pending: BTreeMap<(u64, u32), (String, String)>,
     retries: u32,
     backoff_ms: u64,
+    /// failover endpoints a participant advertised (FAILOVER context):
+    /// when the primary is unreachable the broker answers OBJECT_FORWARD
+    /// with the alternates, so the reference survives a crash
+    failovers: BTreeMap<String, Vec<String>>,
+    /// persisted bindings: the registry survives a broker restart
+    registry_path: Option<PathBuf>,
 }
 
 impl Broker {
@@ -101,6 +109,7 @@ fn main() {
     let mut port = 7620u16;
     let mut urn = "urn:agent:gaip:broker:b1".to_string();
     let mut peers: Vec<String> = Vec::new();
+    let mut registry_path: Option<PathBuf> = None;
     let mut retries = 3u32;
     let mut backoff_ms = 100u64;
 
@@ -110,6 +119,7 @@ fn main() {
             "--host" => host = args.next().unwrap_or(host),
             "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(port),
             "--urn" => urn = args.next().unwrap_or(urn),
+            "--registry" => registry_path = args.next().map(PathBuf::from),
             "--peer" => {
                 if let Some(p) = args.next() {
                     peers.push(p);
@@ -154,7 +164,13 @@ fn main() {
         pending: BTreeMap::new(),
         retries,
         backoff_ms,
+        failovers: BTreeMap::new(),
+        registry_path: registry_path.clone(),
     }));
+    if let Some(path) = &registry_path {
+        broker.lock().unwrap().load_registry(path);
+        eprintln!("[broker] registry loaded from {}", path.display());
+    }
 
     // connect to peer brokers (retry: a peer may start a moment later)
     for addr in &peers {
@@ -309,13 +325,24 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
         WireMessage::LocateRequest { request_id, target } => {
             let b = shared.lock().unwrap();
             let known = b.urn == target || b.local.contains_key(&target);
-            let reply = WireMessage::LocateReply {
-                request_id,
-                status: if known {
-                    gaip_core::LocateStatus::ObjectHere
-                } else {
-                    gaip_core::LocateStatus::UnknownObject
-                },
+            let reply = if known {
+                WireMessage::LocateReply {
+                    request_id,
+                    status: gaip_core::LocateStatus::ObjectHere,
+                }
+            } else if let Some(alts) = b.failovers.get(&target) {
+                // the reference survives the crash: point the caller at
+                // the endpoint that advertised itself as a failover
+                let ior = gaip_core::Ior::new(target.clone(), alts.clone(), "1.0");
+                WireMessage::LocateReply {
+                    request_id,
+                    status: gaip_core::LocateStatus::ObjectForward { forward: ior },
+                }
+            } else {
+                WireMessage::LocateReply {
+                    request_id,
+                    status: gaip_core::LocateStatus::UnknownObject,
+                }
             };
             let _ = b.send(conn, &reply);
             true
@@ -327,14 +354,31 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             body,
         } => {
             // register the participant by the URN it uses
-            if conn.urn.lock().unwrap().is_none() {
+            let registered_new = conn.urn.lock().unwrap().is_none();
+            if registered_new {
                 *conn.urn.lock().unwrap() = Some(body.sender.clone());
+            }
+            let mut ctx = ContextList::from_vec(contexts);
+            if registered_new {
                 let mut b = shared.lock().unwrap();
                 b.local.insert(body.sender.clone(), conn.clone());
+                // FAILOVER context: the participant advertises where else
+                // it can be reached; the reference outlives the socket
+                if let Some(fail) = ctx.get(gaip_core::context::id::FAILOVER) {
+                    let alternates: Vec<String> = fail
+                        .split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect();
+                    if !alternates.is_empty() {
+                        b.failovers.insert(body.sender.clone(), alternates);
+                        if let Some(path) = b.registry_path.clone() {
+                            b.persist_registry(&path);
+                        }
+                    }
+                }
                 eprintln!("[broker] {} registered", body.sender);
             }
-
-            let mut ctx = ContextList::from_vec(contexts);
             let own = shared.lock().unwrap().urn.clone();
             if ctx.route().contains(&own.as_str()) {
                 let reply = WireMessage::Reply {
@@ -452,6 +496,36 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
 
 /// Kept so the broker can advertise itself as an IOR later.
 #[allow(dead_code)]
+impl Broker {
+    fn persist_registry(&self, path: &std::path::Path) {
+        let doc = json!({"failovers": self.failovers});
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, doc.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    fn load_registry(&mut self, path: &std::path::Path) {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(f) = doc.get("failovers").and_then(|v| v.as_object()) {
+                    for (urn, eps) in f {
+                        if let Some(arr) = eps.as_array() {
+                            let list: Vec<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect();
+                            if !list.is_empty() {
+                                self.failovers.insert(urn.clone(), list);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn describe(b: &Broker) -> Envelope {
     Envelope::task_request(
         "msg_broker",
