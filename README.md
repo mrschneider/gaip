@@ -1,5 +1,9 @@
 # GAIP — Gaiko Agentic Interoperability Protocol
 
+[![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
+[![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **A wire format, not a framework.** CORBA's GIOP applied to agents: one
 typed envelope, six universal primitives, and transports you can swap
 without touching the payloads.
@@ -228,7 +232,8 @@ docker run -d --rm -p 4222:4222 nats:2.10-alpine
 ## Verified results
 
 Every claim below is produced by a script in this repo, run in this
-environment. Numbers are the actual output.
+environment and re-run by CI on every push and by the release workflow
+before any binary is packaged. Numbers are the actual output.
 
 **`cargo test --workspace` → 130 unit tests.** They cover the envelope
 (round-trip of the spec's own example), URN and IOR/corbaloc parsing, the
