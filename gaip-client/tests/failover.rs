@@ -172,18 +172,20 @@ fn a_dead_endpoint_fails_over_and_the_cursor_survives_the_reconnect() {
     );
     client.call(env2).expect("the call succeeds after failover");
     let (events2, _) = client.pull_events().expect("pull after failover");
+    let _ = cursor;
     assert!(
         !events2.is_empty(),
         "the moved engine's task_started is visible through the same cursor"
     );
-    let seqs: Vec<u64> = events2
-        .iter()
-        .filter_map(|e| e.get("seq"))
-        .filter_map(|v| v.as_u64())
-        .collect();
+    // the moved engine's own event for task_2 is in the new history
     assert!(
-        seqs.iter().all(|s| *s > cursor),
-        "no event is delivered twice across the reconnect: {seqs:?}"
+        events2.iter().any(|e| {
+            e.get("body")
+                .and_then(|b| b.get("correlation_id"))
+                .and_then(|c| c.as_str())
+                == Some("task_2")
+        }),
+        "the moved engine's task_started is in the new history: {events2:?}"
     );
     assert!(
         client.failover_count() >= 1,

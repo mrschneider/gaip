@@ -82,7 +82,9 @@ pub struct Client {
     stream: Option<TcpStream>,
     buf: Vec<u8>,
     interceptors: Vec<std::sync::Arc<dyn ClientInterceptor>>,
-    /// last event sequence seen, preserved across reconnects
+    /// last event sequence seen. Preserved across plain reconnects to
+    /// the same instance; reset on failover, because the moved engine's
+    /// channel is a new history (its seq space starts over).
     pub event_cursor: u64,
     /// CSIv2 identity token, attached to every TaskRequest
     identity: Option<String>,
@@ -147,6 +149,11 @@ impl Client {
     /// Next endpoint after a failure. The recorder counts it.
     fn advance(&mut self) -> Result<(), GaipError> {
         self.stream = None;
+        // the event channel is per engine instance: after a failover the
+        // moved engine's history starts at seq 1, and the old cursor
+        // belongs to a channel that no longer exists. Resetting is the
+        // honest semantic — events the dead instance held are lost.
+        self.event_cursor = 0;
         self.failover_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.plan.record_failure() {
