@@ -39,8 +39,10 @@
 
 pub mod codec;
 pub mod context;
+pub mod dedupe;
 pub mod envelope;
 pub mod error;
+pub mod flow;
 pub mod idl;
 pub mod ior;
 pub mod lifecycle;
@@ -53,8 +55,10 @@ pub mod trader;
 pub mod urn;
 
 pub use context::{ContextList, ServiceContext};
+pub use dedupe::DedupeCache;
 pub use envelope::{Envelope, MessageType};
 pub use error::GaipError;
+pub use flow::{CreditWindow, FlowError, Outbox};
 pub use idl::{FieldKind, InterfaceRepository, TypeSpec};
 pub use ior::Ior;
 pub use lifecycle::{TaskRegistry, TaskState};
