@@ -183,4 +183,11 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # CI stability: the worker thread is a daemon that writes to stderr,
+    # and CPython can abort at interpreter shutdown trying to flush it
+    # (Fatal Python error: _enter_buffered_busy, exit 134). Flush
+    # everything and exit without running the shutdown machinery.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
