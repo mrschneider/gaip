@@ -1,0 +1,16 @@
+[package]
+name = "gaip-bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GAIP transport bindings: NATS subject bus (and friends)"
+
+[dependencies]
+gaip-core = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "gaip-nats-selftest"
+path = "src/bin/nats_selftest.rs"

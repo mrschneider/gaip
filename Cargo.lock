@@ -48,6 +48,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gaip-bindings"
+version = "0.2.0"
+dependencies = [
+ "gaip-core",
+ "serde_json",
+]
+
+[[package]]
 name = "gaip-broker"
 version = "0.2.0"
 dependencies = [

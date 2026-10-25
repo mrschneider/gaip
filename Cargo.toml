@@ -1,5 +1,5 @@
 [workspace]
-members = ["gaip-core", "gaip-engine", "gaip-broker"]
+members = ["gaip-core", "gaip-engine", "gaip-broker", "gaip-bindings"]
 resolver = "2"
 
 [workspace.package]
