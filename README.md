@@ -136,6 +136,9 @@ The payload contract is transport-agnostic; `gaip-core` is IO-free.
 |---|---|---|
 | **Framed TCP** (reference) | implemented + tested | `u32` big-endian length + JSON envelope |
 | **SSE** (`text/event-stream`) | implemented (encoder/decoder + keep-alive) | `event: <PRIMITIVE>` + multi-line `data:` |
+| **NATS** | implemented + tested against nats-server 2.10 | `WireMessage` JSON as the payload; `gaip.<primitive>.<correlation>` |
+| **gRPC / HTTP/2** | implemented + tested over real HTTP/2 | unary `Send` = Request/Reply, bidi `Stream` = TASK_STREAM |
+| **TLS** | implemented + tested (TLS 1.3) | same frames over a rustls-wrapped socket, `--tls-cert/--tls-key` |
 | gRPC / HTTP/2 | planned — same envelope as the message body | unary `Send(Envelope) returns (Envelope)` + server-stream for `TASK_STREAM` |
 | Kafka / NATS | planned — same envelope as the message value | key = `correlation_id` so a task's frames stay ordered on one partition |
 
@@ -235,15 +238,17 @@ experiments/    runnable end-to-end proof (a Python peer on purpose:
 * **Dynamic schema distribution** — the IR is served over
   `CAPABILITY_QUERY` and validated locally; there is no registry that
   pushes new intents to peers.
-* **Full CSIv2** — the identity assertion, roles and delegation are
-  implemented and verified; the transport half (TLS/GSSAPI) is not. Run
-  it inside mTLS.
+* **CSIv2 over TLS — done, with one caveat** — the engine serves TLS 1.3
+  (`--tls-cert/--tls-key`), verified by `experiment_005_tls.py`; GSSAPI
+  (Kerberos) is still not implemented, so the token type is the identity
+  assertion, not a GSS token.
 * **Trader query language** — constraints are a conjunction of typed
   predicates (capability, runtime, version prefix, numeric minimum, text
   equality), not an expression language.
 * **Multi-broker routing** — `OBJECT_FORWARD` hands back a reference;
   following it across brokers is the caller's job.
-* **Backpressure** — a slow peer blocks its writer; no flow control.
+* **Kafka binding** — not implemented. The other two bindings prove the
+  pattern; this one needs a broker container and `rdkafka`.
 
 ## License
 

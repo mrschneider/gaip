@@ -15,6 +15,7 @@
 
 use gaip_core::codec::{decode_wire, encode_wire};
 use gaip_core::context::{now_ms, ContextList, ServiceContext};
+use gaip_core::flow::Outbox;
 use gaip_core::idl::InterfaceRepository;
 use gaip_core::lifecycle::TaskRegistry;
 use gaip_core::message::{LocateStatus, ReplyStatus, SystemMinor, WireMessage};
@@ -23,15 +24,38 @@ use gaip_core::security::{authorize, Credentials, IdentityAssertion};
 use gaip_core::{Envelope, GaipError, Ior, MessageType};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::BufReader;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc as StdArc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+/// A connection is either plain TCP or TLS; the protocol above it is
+/// identical, which is the point of the transport half of CSIv2.
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
+
+type Io = StdArc<Mutex<Box<dyn ReadWrite>>>;
+
+/// Write half handed to the Outbox: it locks the same connection the
+/// reader uses, so a TLS session (which is stateful and cannot be
+/// cloned) stays consistent.
+struct OutHandle(Io);
+impl Write for OutHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
 struct Peer {
     urn: String,
-    writer: Arc<Mutex<TcpStream>>,
+    /// bounded output queue: a stalled peer must not block the engine
+    out: Arc<Outbox>,
     ir: Arc<std::sync::RwLock<InterfaceRepository>>,
     creds: Arc<Credentials>,
     policies: Policies,
@@ -57,10 +81,19 @@ impl Peer {
 
     fn send_raw(&self, msg: &WireMessage) -> Result<(), GaipError> {
         let bytes = encode_wire(msg)?;
-        let mut w = self.writer.lock().unwrap();
-        w.write_all(&bytes)
-            .map_err(|e| GaipError::Json(e.to_string()))?;
-        w.flush().map_err(|e| GaipError::Json(e.to_string()))
+        match self.out.send(bytes) {
+            Ok(()) => Ok(()),
+            // BACKPRESSURE: the peer is not draining. This becomes a
+            // retryable Unavailable reply instead of a blocked write.
+            Err(gaip_core::flow::FlowError::Full { queued }) => Err(GaipError::BadField {
+                field: "flow",
+                why: format!("peer is not draining ({queued} queued)"),
+            }),
+            Err(gaip_core::flow::FlowError::Closed) => Err(GaipError::BadField {
+                field: "flow",
+                why: "connection closed".to_string(),
+            }),
+        }
     }
 
     /// Send, fragmenting when the message exceeds the policy size.
@@ -99,6 +132,8 @@ fn main() {
     let mut idl_path = "schema/intents.idl".to_string();
     let mut key = "dev-shared-secret".to_string();
     let mut fragment_size = 64 * 1024usize;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -108,6 +143,8 @@ fn main() {
             "--name" => name = args.next().unwrap_or(name),
             "--idl" => idl_path = args.next().unwrap_or(idl_path),
             "--key" => key = args.next().unwrap_or(key),
+            "--tls-cert" => tls_cert = args.next(),
+            "--tls-key" => tls_key = args.next(),
             "--fragment-size" => {
                 fragment_size = args
                     .next()
@@ -117,7 +154,8 @@ fn main() {
             "-h" | "--help" => {
                 println!(
                     "gaip-engine [--host 127.0.0.1] [--port 7610] [--name urn:...] \
-                     [--idl schema/intents.idl] [--key secret] [--fragment-size 65536]"
+                     [--idl schema/intents.idl] [--key secret] [--fragment-size 65536] \
+                     [--tls-cert cert.pem --tls-key key.pem]"
                 );
                 return;
             }
@@ -143,6 +181,33 @@ fn main() {
         }
     };
 
+    // CSIv2 transport half: TLS around the same protocol. The identity
+    // assertion still proves *who*, TLS proves *with whom*.
+    let tls: Option<StdArc<rustls::ServerConfig>> = match (tls_cert, tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(
+                std::fs::File::open(&cert_path).expect("tls cert"),
+            ))
+            .collect::<Result<_, _>>()
+            .expect("tls cert parse");
+            let key = rustls_pemfile::private_key(&mut BufReader::new(
+                std::fs::File::open(&key_path).expect("tls key"),
+            ))
+            .expect("tls key parse")
+            .expect("tls key present");
+            let cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("tls config");
+            Some(StdArc::new(cfg))
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!("gaip-engine: --tls-cert and --tls-key go together");
+            std::process::exit(2);
+        }
+    };
+
     let listener = match TcpListener::bind((host.as_str(), port)) {
         Ok(l) => l,
         Err(e) => {
@@ -155,19 +220,39 @@ fn main() {
         ir.len()
     );
 
+    eprintln!(
+        "[engine] transport: {}",
+        if tls.is_some() {
+            "TLS (rustls)"
+        } else {
+            "plain TCP"
+        }
+    );
     for (i, stream) in listener.incoming().flatten().enumerate() {
         let _ = stream.set_nodelay(true);
-        let writer = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => continue,
+        // a read timeout is what lets the reader release the connection
+        // lock periodically (a TLS session cannot be cloned)
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let io: Io = match &tls {
+            Some(cfg) => match rustls::ServerConnection::new(cfg.clone()) {
+                Ok(conn) => StdArc::new(Mutex::new(
+                    Box::new(rustls::StreamOwned::new(conn, stream)) as Box<dyn ReadWrite>,
+                )),
+                Err(e) => {
+                    eprintln!("[engine] tls handshake setup failed: {e}");
+                    continue;
+                }
+            },
+            None => StdArc::new(Mutex::new(Box::new(stream) as Box<dyn ReadWrite>)),
         };
+        let out = Arc::new(Outbox::spawn(OutHandle(io.clone()), 256));
         let policies = Policies {
             fragment_size,
             ..Policies::default()
         };
         let peer = Arc::new(Peer {
             urn: name.clone(),
-            writer: Arc::new(Mutex::new(writer)),
+            out,
             ir: Arc::new(std::sync::RwLock::new(ir.clone())),
             creds: Arc::new(Credentials::new(key.clone().into_bytes())),
             policies,
@@ -187,19 +272,31 @@ fn main() {
         let n = i + 1;
         std::thread::spawn(move || {
             eprintln!("[engine] peer {n} connected");
-            serve(peer, stream);
+            serve(peer, io);
             eprintln!("[engine] peer {n} closed");
         });
     }
 }
 
-fn serve(peer: Arc<Peer>, mut stream: TcpStream) {
+fn serve(peer: Arc<Peer>, io: Io) {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16384];
     loop {
-        match stream.read(&mut chunk) {
+        // hold the lock only for the read, then release it so the Outbox
+        // writer can use the same (stateful, TLS) connection
+        let read = {
+            let mut guard = io.lock().unwrap();
+            guard.read(&mut chunk)
+        };
+        match read {
             Ok(0) => return,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(_) => return,
         }
         loop {
