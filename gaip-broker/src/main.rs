@@ -29,7 +29,7 @@ use gaip_core::flow::{FlowError, Outbox};
 use gaip_core::message::{ReplyStatus, SystemMinor, WireMessage};
 use gaip_core::Envelope;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -272,7 +272,7 @@ fn serve(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
 
 fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bool {
     match msg {
-        WireMessage::CloseConnection => return false,
+        WireMessage::CloseConnection => false,
 
         WireMessage::Reply {
             request_id,
