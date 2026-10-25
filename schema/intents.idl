@@ -33,3 +33,7 @@ intent LOCK_RELEASE version 1.0 {
 intent EVENT_PULL version 1.0 {
   after_seq: int?
 }
+
+intent GRANT_CREDITS version 1.0 {
+  count: int
+}

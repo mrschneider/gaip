@@ -575,10 +575,11 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             true
         }
 
-        WireMessage::SchemaSync { idl } => {
+        WireMessage::SchemaSync { idl, contexts } => {
             // a schema push is forwarded to every participant so the
-            // fleet converges on one contract
-            let msg = WireMessage::SchemaSync { idl };
+            // fleet converges on one contract; the contexts (the signed
+            // identity) travel with it
+            let msg = WireMessage::SchemaSync { idl, contexts };
             let local: Vec<Arc<Conn>> = shared.lock().unwrap().local.values().cloned().collect();
             for c in local {
                 let b = shared.lock().unwrap();

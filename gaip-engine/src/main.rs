@@ -76,6 +76,9 @@ struct Peer {
     locks: Arc<Mutex<gaip_core::locks::LockSet>>,
     /// run telemetry with QoS (CosNotification-lite), process-wide
     events: Arc<Mutex<gaip_core::events::EventChannel>>,
+    /// stream credits granted by THIS connection's consumer: a
+    /// TASK_STREAM costs one; a producer without credits waits
+    credits: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl Peer {
@@ -132,6 +135,25 @@ impl Peer {
         };
         if let Err(e) = self.send(msg) {
             eprintln!("[engine] reply failed: {e}");
+        }
+    }
+
+    /// Consume one stream credit, waiting up to `timeout` for the
+    /// consumer to grant more. The deadline still governs: a wait that
+    /// would outlive the budget gives up (the caller reports Timeout).
+    fn take_credit(&self, deadline: Option<u128>) -> bool {
+        let limit = deadline.unwrap_or_else(|| now_ms() + 10_000);
+        loop {
+            if now_ms() >= limit {
+                return false;
+            }
+            let before = self.credits.fetch_sub(1, Ordering::SeqCst);
+            if before > 0 {
+                return true;
+            }
+            // nothing granted: put it back and wait politely
+            self.credits.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -308,6 +330,7 @@ fn main() {
             recorder: shared_recorder.clone(),
             locks: shared_locks.clone(),
             events: shared_events.clone(),
+            credits: Arc::new(std::sync::atomic::AtomicI64::new(2)),
         });
         let n = i + 1;
         std::thread::spawn(move || {
@@ -451,7 +474,27 @@ fn dispatch(peer: &Arc<Peer>, msg: WireMessage) -> bool {
             }
             true
         }
-        WireMessage::SchemaSync { idl } => {
+        WireMessage::SchemaSync { idl, contexts } => {
+            // SIGNED SCHEMA PUSH: the identity context must verify and
+            // carry the schema_admin role — a poisoned declaration is a
+            // refusal, not a fleet-wide accident
+            let verified = ContextList::from_vec(contexts)
+                .get(gaip_core::context::id::IDENTITY)
+                .and_then(|token| {
+                    let sc =
+                        ServiceContext::new(gaip_core::context::id::IDENTITY, token.to_string());
+                    peer.creds.verify(&sc).ok()
+                });
+            let authorized = verified
+                .as_ref()
+                .map(|id| id.has_role("schema_admin"))
+                .unwrap_or(false);
+            if !authorized {
+                let _ = peer.send(WireMessage::MessageError {
+                    reason: "schema sync refused: unsigned or not schema_admin".to_string(),
+                });
+                return true;
+            }
             // merge a peer's declarations into our repository; a
             // conflicting redefinition is refused, not overwritten
             let mut repo = peer.ir.read().unwrap().clone();
@@ -672,6 +715,23 @@ fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContex
             );
             return;
         }
+        "GRANT_CREDITS" => {
+            let count = env
+                .payload
+                .get("count")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let granted = peer.credits.fetch_add(count, Ordering::SeqCst) + count;
+            peer.reply_ok(
+                request_id,
+                env.reply_to(
+                    peer.msg_id("msg"),
+                    json!({"intent": "GRANT_CREDITS", "granted": count,
+                           "available": granted.max(0)}),
+                ),
+            );
+            return;
+        }
         "EVENT_PULL" => {
             let after = env
                 .payload
@@ -860,6 +920,14 @@ fn run_task(peer: Arc<Peer>, request_id: u32, req: Envelope, ctx: ContextList) {
                 );
                 return;
             }
+        }
+        if !peer.take_credit(deadline) {
+            peer.reply(
+                request_id,
+                ReplyStatus::system(SystemMinor::Timeout, "stream credits exhausted".to_string()),
+                None,
+            );
+            return;
         }
         let stream_env = req.stream_to(
             peer.msg_id("msg"),

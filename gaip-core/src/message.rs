@@ -152,7 +152,13 @@ pub enum WireMessage {
     /// Push of new interface declarations (IDL text). A transport-level
     /// message, not an agent primitive: distributing the contract is not
     /// an operation of the six.
-    SchemaSync { idl: String },
+    /// A schema push. Signed: the identity context is verified by the
+    /// receiver, and a push without a schema-admin identity is refused.
+    SchemaSync {
+        idl: String,
+        #[serde(default)]
+        contexts: Vec<ServiceContext>,
+    },
     /// Continuation of a fragmented message (GIOP 1.1+).
     Fragment {
         request_id: u32,
