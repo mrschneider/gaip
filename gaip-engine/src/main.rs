@@ -32,7 +32,7 @@ use std::time::Duration;
 struct Peer {
     urn: String,
     writer: Arc<Mutex<TcpStream>>,
-    ir: Arc<InterfaceRepository>,
+    ir: Arc<std::sync::RwLock<InterfaceRepository>>,
     creds: Arc<Credentials>,
     policies: Policies,
     /// fragment runs in progress, keyed by request id
@@ -168,7 +168,7 @@ fn main() {
         let peer = Arc::new(Peer {
             urn: name.clone(),
             writer: Arc::new(Mutex::new(writer)),
-            ir: Arc::new(ir.clone()),
+            ir: Arc::new(std::sync::RwLock::new(ir.clone())),
             creds: Arc::new(Credentials::new(key.clone().into_bytes())),
             policies,
             fragments: Mutex::new(BTreeMap::new()),
@@ -308,6 +308,29 @@ fn dispatch(peer: &Arc<Peer>, msg: WireMessage) -> bool {
             }
             true
         }
+        WireMessage::SchemaSync { idl } => {
+            // merge a peer's declarations into our repository; a
+            // conflicting redefinition is refused, not overwritten
+            let mut repo = peer.ir.read().unwrap().clone();
+            match gaip_core::schema_sync::merge(&mut repo, &gaip_core::SchemaSync::new("peer", idl))
+            {
+                Ok(report) => {
+                    eprintln!(
+                        "[engine] schema sync: {} added, {} unchanged",
+                        report.added.len(),
+                        report.unchanged.len()
+                    );
+                    *peer.ir.write().unwrap() = repo;
+                }
+                Err(e) => {
+                    eprintln!("[engine] schema sync refused: {e}");
+                    let _ = peer.send(WireMessage::MessageError {
+                        reason: format!("schema sync refused: {e}"),
+                    });
+                }
+            }
+            true
+        }
         WireMessage::LocateReply { request_id, .. } => {
             eprintln!("[engine] locate reply {request_id}");
             true
@@ -390,7 +413,12 @@ fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContex
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        if let Err(e) = peer.ir.validate_payload(&intent, "1.0", &env.payload) {
+        if let Err(e) = peer
+            .ir
+            .read()
+            .unwrap()
+            .validate_payload(&intent, "1.0", &env.payload)
+        {
             peer.reply(
                 request_id,
                 ReplyStatus::user("E_SCHEMA", e.to_string()),
@@ -414,12 +442,12 @@ fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContex
 
     match env.message_type {
         MessageType::CapabilityQuery => {
-            let intents: Vec<Value> = peer
-                .ir
+            let ir = peer.ir.read().unwrap();
+            let intents: Vec<Value> = ir
                 .list()
                 .into_iter()
                 .map(|(i, v)| {
-                    let spec = peer.ir.lookup(i, v).expect("listed");
+                    let spec = ir.lookup(i, v).expect("listed");
                     json!({
                         "intent": i,
                         "version": v,

@@ -1,0 +1,16 @@
+[package]
+name = "gaip-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GAIP relay broker: URN routing, federated discovery, retry, dedupe, backpressure"
+
+[[bin]]
+name = "gaip-broker"
+path = "src/main.rs"
+
+[dependencies]
+gaip-core = { workspace = true }
+serde_json = { workspace = true }

@@ -145,6 +145,10 @@ pub enum WireMessage {
     MessageError { reason: String },
     /// Graceful shutdown; no reply is expected.
     CloseConnection,
+    /// Push of new interface declarations (IDL text). A transport-level
+    /// message, not an agent primitive: distributing the contract is not
+    /// an operation of the six.
+    SchemaSync { idl: String },
     /// Continuation of a fragmented message (GIOP 1.1+).
     Fragment {
         request_id: u32,
@@ -200,7 +204,7 @@ impl WireMessage {
             | Self::LocateReply { request_id, .. }
             | Self::CancelRequest { request_id }
             | Self::Fragment { request_id, .. } => Some(*request_id),
-            Self::MessageError { .. } | Self::CloseConnection => None,
+            Self::MessageError { .. } | Self::CloseConnection | Self::SchemaSync { .. } => None,
         }
     }
 
