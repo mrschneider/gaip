@@ -1,0 +1,12 @@
+[package]
+name = "gaip-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GAIP — Agentic Interoperability Protocol: typed envelopes, six universal primitives, transport-agnostic framing"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

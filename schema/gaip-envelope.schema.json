@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mrschneider/gaip/schema/gaip-envelope.schema.json",
+  "title": "GAIP Envelope",
+  "description": "Gaiko Agentic Interoperability Protocol v1.0 — the only shared contract between participants. A participant deserializes this and nothing else.",
+  "type": "object",
+  "required": [
+    "protocol_version",
+    "message_id",
+    "correlation_id",
+    "sender",
+    "recipient",
+    "message_type",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$",
+      "description": "Major must match the peer's. Minor versions are additive by contract."
+    },
+    "message_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Unique per message. Used for deduplication and tracing."
+    },
+    "correlation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "The task this message belongs to. A reply inherits it, which is what makes replies routable with no session state."
+    },
+    "sender": {
+      "$ref": "#/$defs/agentUrn"
+    },
+    "recipient": {
+      "$ref": "#/$defs/agentUrn"
+    },
+    "message_type": {
+      "type": "string",
+      "enum": [
+        "TASK_REQUEST",
+        "TASK_REPLY",
+        "TASK_STREAM",
+        "CANCEL_REQUEST",
+        "CAPABILITY_QUERY",
+        "HUMAN_INTERVENT"
+      ],
+      "description": "The closed vocabulary. Six primitives, no invented verbs."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Typed body, defined per intent. Artifacts above ~8 MiB travel by reference (artifacts_ref), never inline."
+    }
+  },
+  "$defs": {
+    "agentUrn": {
+      "type": "string",
+      "pattern": "^urn:agent:[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,64}(:[A-Za-z0-9._-]{1,64})?$",
+      "description": "urn:agent:<runtime>:<framework>:<name>[:<version>] — the runtime and framework are part of the address on purpose."
+    }
+  }
+}

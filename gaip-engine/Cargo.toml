@@ -1,0 +1,16 @@
+[package]
+name = "gaip-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GAIP reference participant: a Rust analytics engine speaking the six primitives over a framed TCP binding"
+
+[[bin]]
+name = "gaip-engine"
+path = "src/main.rs"
+
+[dependencies]
+gaip-core = { workspace = true }
+serde_json = { workspace = true }
