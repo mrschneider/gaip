@@ -451,7 +451,7 @@ impl Expr {
                     },
                     (Some(AttrValue::Text(a)), Lit::Bool(b)) => match op {
                         CmpOp::Eq => a == b.to_string(),
-                        CmpOp::Ne => &a != &b.to_string(),
+                        CmpOp::Ne => a != b.to_string(),
                         _ => false,
                     },
                     _ => false,

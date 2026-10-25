@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn a_draining_peer_receives_everything() {
         let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (tx, rx) = channel::<()>();
+        let (tx, _rx) = channel::<()>();
         struct W(Arc<std::sync::Mutex<Vec<u8>>>);
         impl Write for W {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -203,16 +203,15 @@ mod tests {
         assert_eq!(ob.stats().sent, 10);
         assert_eq!(out.lock().unwrap().len(), 10);
         drop(tx);
-        drop(rx);
     }
 
     #[test]
     fn a_stalled_peer_gets_a_refusal_not_a_blocked_thread() {
         let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (tx, rx) = channel::<()>();
+        let (tx, _rx) = channel::<()>();
         let ob = Outbox::spawn(
             SlowWriter {
-                gate: rx,
+                gate: _rx,
                 out: out.clone(),
             },
             2,
@@ -239,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_closed_connection_reports_closed() {
-        let (tx, rx) = channel::<()>();
+        let (tx, _rx) = channel::<()>();
         struct Failing;
         impl Write for Failing {
             fn write(&mut self, _b: &[u8]) -> std::io::Result<usize> {
