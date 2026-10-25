@@ -230,7 +230,7 @@ docker run -d --rm -p 4222:4222 nats:2.10-alpine
 Every claim below is produced by a script in this repo, run in this
 environment. Numbers are the actual output.
 
-**`cargo test --workspace` → 111 unit tests.** They cover the envelope
+**`cargo test --workspace` → 130 unit tests.** They cover the envelope
 (round-trip of the spec's own example), URN and IOR/corbaloc parsing, the
 closed vocabulary, version policy, lifecycle (cancel acknowledgement,
 human resume), fragmentation and reassembly (gaps, reorder, mixed runs),
@@ -307,6 +307,23 @@ test grpc::tests::bidi_stream_answers_every_frame_on_the_same_stream ... ok
 test grpc::tests::a_frame_that_is_not_a_gaip_message_is_refused_with_invalid_argument ... ok
 ```
 
+**`experiments/experiment_006_robustness.py` → 12/12 PASS**:
+
+```
+PASS: failover: OBJECT_FORWARD carries the advertised alternate
+PASS: persistence: the failover registry survives a broker restart
+PASS: failover: the moved reference serves the same URN
+PASS: locks: the first holder acquires
+PASS: locks: a second writer is refused with E_LOCKED
+PASS: locks: the holder releases
+PASS: locks: after release the next acquirer wins
+PASS: locks: a short lease is granted
+PASS: locks: an expired lease is released implicitly
+PASS: events: run telemetry is pullable with a cursor
+PASS: events: a cursor is not rewound (nothing twice)
+PASS: stats: the surface reports counts, not guesses
+```
+
 **`experiments/experiment_005_tls.py` → 4/4 PASS**:
 
 ```
@@ -326,7 +343,12 @@ gaip-core/       the contract — no IO at all
                  language), IDL+IR, schema sync, policies, CSIv2, dedupe,
                  flow control
 gaip-engine/     reference participant: the six primitives, IR validation,
-                 bidirectional callbacks, deadlines, TLS, Outbox writes
+                 bidirectional callbacks, deadlines, TLS, Outbox writes,
+                 interceptors (recorder + stats surface), locks with
+                 leases, event channel, operational intents
+                 (LOCK_ACQUIRE/LOCK_RELEASE/EVENT_PULL)
+gaip-core/…/     failover (the messaging plan), interceptor hooks, locks,
+                 events — the CORBA-derived robustness modules
 gaip-broker/     relay: URN routing, federated discovery, retry,
                  exactly-once effect, loop safety, backpressure
 gaip-bindings/   NATS, gRPC (proto/gaip.proto), and the NATS self-test binary
@@ -354,11 +376,19 @@ Honest scope, so nothing here is mistaken for done:
 * **Exactly-once only within the dedupe window** — 4096 entries / 120 s in
   the broker; beyond that a duplicate is a new message. The window is
   stated, not implied.
+* **Client-side interceptors** — the interceptor ring is server-side;
+  there is no real client crate yet (the experiments are Python).
+* **Failover is reference-level, not connection-level** — the broker
+  hands the caller a forwarded reference and the caller dials the
+  alternate; the broker does not proxy the stream itself.
+* **The lock and event surfaces are engine-local** — locks with leases
+  and the event channel are per process; they do not cross brokers.
 
 ## Version history
 
 | Version | What landed |
 |---|---|
+| **v0.4.0** | CORBA-derived robustness: portable interceptors + status surface, transparent failover (OBJECT_FORWARD with persisted registry), persistent references, locks with leases (CosConcurrency-lite), event channel with QoS (CosNotification-lite), corbaname |
 | **v0.3.0** | broker (federation, retry, dedupe, loop safety), schema push, trader query language, backpressure, NATS + gRPC + TLS bindings |
 | v0.2.0 | GIOP wire layer: fragments, service contexts, locate/OBJECT_FORWARD, typed exceptions, IOR/naming/trader, IDL+IR, bidirectional calls, policies, CSIv2 assertion |
 | v0.1.0 | typed envelope, six primitives, lifecycle, framed TCP + SSE |

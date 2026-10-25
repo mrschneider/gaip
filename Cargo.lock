@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-bindings"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gaip-core",
  "prost",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-broker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gaip-core",
  "serde_json",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hmac",
  "serde",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gaip-core",
  "rustls",
