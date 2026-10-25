@@ -3,7 +3,7 @@ members = ["gaip-core", "gaip-engine", "gaip-broker", "gaip-bindings", "gaip-cli
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Guilherme <guilherme.barcha@gmail.com>"]

@@ -235,7 +235,7 @@ Every claim below is produced by a script in this repo, run in this
 environment and re-run by CI on every push and by the release workflow
 before any binary is packaged. Numbers are the actual output.
 
-**`cargo test --workspace` → 130 unit tests.** They cover the envelope
+**`cargo test --workspace` → 134 unit tests.** They cover the envelope
 (round-trip of the spec's own example), URN and IOR/corbaloc parsing, the
 closed vocabulary, version policy, lifecycle (cancel acknowledgement,
 human resume), fragmentation and reassembly (gaps, reorder, mixed runs),
@@ -329,6 +329,18 @@ PASS: events: a cursor is not rewound (nothing twice)
 PASS: stats: the surface reports counts, not guesses
 ```
 
+**`experiments/experiment_007_checkpoint.py` → 3/3 PASS** — SIGTERM, the
+dedupe window written to `--state`, restart from the same file, and the
+replay answering **identically without re-executing**; a new message
+after the restart is a new exchange (the moved participant is not
+resurrected):
+
+```
+PASS: checkpoint: the dedupe window survived the restart
+PASS: replay: the reply was identical (no re-execution)
+PASS: new message: a new exchange after restart is a new exchange
+```
+
 **`experiments/experiment_005_tls.py` → 4/4 PASS**:
 
 ```
@@ -357,6 +369,10 @@ gaip-core/…/     failover (the messaging plan), interceptor hooks, locks,
 gaip-broker/     relay: URN routing, federated discovery, retry,
                  exactly-once effect, loop safety, backpressure
 gaip-bindings/   NATS, gRPC (proto/gaip.proto), and the NATS self-test binary
+gaip-client/     the caller half: managed connection, transparent failover
+                 (the messaging plan driving a real socket), event cursor
+                 that resumes across reconnects, client-side interceptors,
+                 CSIv2 identity on every request
 schema/          gaip-envelope.schema.json (wire contract), intents.idl
 experiments/     5 runnable proofs (Python peers on purpose: the point is
                  cross-runtime interop)
@@ -393,6 +409,7 @@ Honest scope, so nothing here is mistaken for done:
 
 | Version | What landed |
 |---|---|
+| **v0.5.0** | at-least-once made explicit: DELIVERED stamp + dead-letter journal, stream credits on the wire, signed schema push, deadline at the edge + negative cache, `gaip-client` crate (failover + cursor + client interceptors), broker checkpoint (the dedupe window survives restarts) |
 | **v0.4.0** | CORBA-derived robustness: portable interceptors + status surface, transparent failover (OBJECT_FORWARD with persisted registry), persistent references, locks with leases (CosConcurrency-lite), event channel with QoS (CosNotification-lite), corbaname |
 | **v0.3.0** | broker (federation, retry, dedupe, loop safety), schema push, trader query language, backpressure, NATS + gRPC + TLS bindings |
 | v0.2.0 | GIOP wire layer: fragments, service contexts, locate/OBJECT_FORWARD, typed exceptions, IOR/naming/trader, IDL+IR, bidirectional calls, policies, CSIv2 assertion |
