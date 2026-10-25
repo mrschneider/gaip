@@ -131,6 +131,7 @@ impl NatsBinding {
     }
 
     /// Block for the next message (subject, wire message).
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> std::io::Result<Option<(String, WireMessage)>> {
         loop {
             let mut line = String::new();
@@ -144,10 +145,7 @@ impl NatsBinding {
                 continue;
             }
             if line.starts_with("-ERR") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("bus error: {line}"),
-                ));
+                return Err(std::io::Error::other(format!("bus error: {line}")));
             }
             if !line.starts_with("MSG ") {
                 continue; // +OK / INFO / PONG
