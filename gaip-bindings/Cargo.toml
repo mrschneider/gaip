@@ -10,6 +10,14 @@ description = "GAIP transport bindings: NATS subject bus (and friends)"
 [dependencies]
 gaip-core = { workspace = true }
 serde_json = { workspace = true }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
 
 [[bin]]
 name = "gaip-nats-selftest"

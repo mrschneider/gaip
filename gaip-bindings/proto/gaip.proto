@@ -1,0 +1,24 @@
+// GAIP gRPC binding.
+//
+// The contract does not change with the transport: a WireFrame carries
+// exactly the bytes a framed TCP connection would carry, so a peer can
+// switch bindings without touching its envelope handling.
+//
+// Mapping (documented in the README):
+//   Send   (unary)  = one Request -> one Reply
+//   Stream (bidi)   = TASK_STREAM events in both directions
+syntax = "proto3";
+
+package gaip.v1;
+
+service GaipTransport {
+  rpc Send(WireFrame) returns (WireFrame);
+  rpc Stream(stream WireFrame) returns (stream WireFrame);
+}
+
+message WireFrame {
+  // length-prefixed GAIP wire message, byte-identical to the TCP binding
+  bytes gaip = 1;
+  // routing hint for a gateway: subject / channel / partition key
+  string subject = 2;
+}

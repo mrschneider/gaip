@@ -5,4 +5,5 @@
 //! Each binding here is tested against a real peer, not against a mock
 //! that agrees with itself.
 
+pub mod grpc;
 pub mod nats;
