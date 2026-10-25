@@ -285,3 +285,37 @@ mod checkpoint_tests {
         assert!(rows.is_empty(), "a dead entry does not survive the restart");
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::envelope::Envelope;
+    use serde_json::json;
+
+    /// The checkpoint stores each reply as a JSON string. A round-trip
+    /// that fails here is a checkpoint that silently restores nothing —
+    /// exactly-once would degrade to at-least-once after a restart.
+    #[test]
+    fn a_reply_round_trips_through_the_checkpoint_string() {
+        let env = Envelope::new(
+            "ack_mx1".to_string(),
+            "c1".to_string(),
+            "urn:agent:rust:tokio:worker-v1".to_string(),
+            "urn:agent:python:langgraph:planner-v2".to_string(),
+            crate::envelope::MessageType::TaskReply,
+            json!({"status": "OK"}),
+        );
+        let msg = WireMessage::Reply {
+            request_id: 9,
+            status: ReplyStatus::NoException,
+            body: Some(env),
+            contexts: Vec::new(),
+        };
+        let wire = serde_json::to_string(&msg).expect("serialize");
+        let back: Result<WireMessage, _> = serde_json::from_str(&wire);
+        match back {
+            Ok(m) => assert_eq!(m, msg, "round-trip must be lossless"),
+            Err(e) => panic!("deserialization failed: {e}\nwire: {wire}"),
+        }
+    }
+}

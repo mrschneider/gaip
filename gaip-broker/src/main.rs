@@ -183,6 +183,14 @@ fn main() {
         draining: std::sync::atomic::AtomicBool::new(false),
         state_path: state_path.clone(),
     }));
+    // THE STATE FILE IS THE CHECKPOINT: --state carries the dedupe window
+    // and failovers written at shutdown, so the restart restores from it —
+    // loading only --registry forgets every completed exchange and turns
+    // exactly-once into at-least-once across the restart
+    if let Some(path) = &state_path {
+        broker.lock().unwrap().load_registry(path);
+        eprintln!("[broker] state loaded from {}", path.display());
+    }
     if let Some(path) = &registry_path {
         broker.lock().unwrap().load_registry(path);
         eprintln!("[broker] registry loaded from {}", path.display());
@@ -206,6 +214,9 @@ fn main() {
                 .draining
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             b.lock().unwrap().checkpoint();
+            // the accept loop cannot be interrupted out of `incoming()`;
+            // the checkpoint is written, so exiting here is the clean cut
+            std::process::exit(0);
         });
     }
 
@@ -684,6 +695,30 @@ impl Broker {
     fn load_registry(&mut self, path: &std::path::Path) {
         if let Ok(text) = std::fs::read_to_string(path) {
             if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+                // RESTORE THE DEDUPE WINDOW: a completed exchange that
+                // survived the checkpoint must replay after the restart —
+                // forgetting it turns exactly-once into at-least-once
+                if let Some(rows) = doc.get("dedupe").and_then(|v| v.as_array()) {
+                    let restored: Vec<(String, String, u128, WireMessage)> = rows
+                        .iter()
+                        .filter_map(|r| {
+                            let sender = r.get("sender")?.as_str()?.to_string();
+                            let msg_id = r.get("message_id")?.as_str()?.to_string();
+                            let left_ms = r.get("left_ms")?.as_u64()? as u128;
+                            let reply: WireMessage =
+                                serde_json::from_str(r.get("reply")?.as_str()?).ok()?;
+                            Some((sender, msg_id, left_ms, reply))
+                        })
+                        .collect();
+                    let n = restored.len();
+                    self.dedupe.restore(std::time::Instant::now(), restored);
+                    if n > 0 {
+                        eprintln!(
+                            "[broker] restored {n} completed exchanges from {}",
+                            path.display()
+                        );
+                    }
+                }
                 if let Some(f) = doc.get("failovers").and_then(|v| v.as_object()) {
                     for (urn, eps) in f {
                         if let Some(arr) = eps.as_array() {
