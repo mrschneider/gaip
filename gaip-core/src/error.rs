@@ -87,3 +87,13 @@ impl From<serde_json::Error> for GaipError {
         Self::Json(e.to_string())
     }
 }
+
+impl GaipError {
+    /// True when the failure happened before any reply byte: the request
+    /// may not have been processed, so a failover retry is safe.
+    pub fn is_transient_no_reply(&self) -> bool {
+        matches!(self, GaipError::BadField { field, why }
+            if (field == &"write" || field == &"read")
+                && (why.contains("closed") || why.contains("write") || why.contains("connect")))
+    }
+}

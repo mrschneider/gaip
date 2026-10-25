@@ -336,6 +336,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gaip-client"
+version = "0.4.0"
+dependencies = [
+ "crypto-common",
+ "digest",
+ "gaip-core",
+ "hmac",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "gaip-core"
 version = "0.4.0"
 dependencies = [
