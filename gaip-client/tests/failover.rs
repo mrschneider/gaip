@@ -40,6 +40,7 @@ fn json(fields: &[(&str, serde_json::Value)]) -> String {
     serde_json::Value::Object(m).to_string()
 }
 
+#[allow(clippy::zombie_processes)] // the test kills the engine explicitly
 fn spawn_engine(port: u16, log: &str) -> Child {
     let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/gaip-engine");
     Command::new(bin)
@@ -191,4 +192,5 @@ fn a_dead_endpoint_fails_over_and_the_cursor_survives_the_reconnect() {
     );
 
     let _ = b.kill();
+    let _ = b.wait();
 }
