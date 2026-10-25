@@ -41,6 +41,7 @@ impl GaipService {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn to_frame(msg: &WireMessage, subject: &str) -> Result<WireFrame, Status> {
     let gaip = encode_wire(msg).map_err(|e| Status::internal(e.to_string()))?;
     Ok(WireFrame {
@@ -49,6 +50,7 @@ fn to_frame(msg: &WireMessage, subject: &str) -> Result<WireFrame, Status> {
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn from_frame(frame: &WireFrame) -> Result<WireMessage, Status> {
     match decode_wire(&frame.gaip) {
         Ok(Some((m, _))) => Ok(m),
