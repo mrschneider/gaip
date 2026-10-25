@@ -128,6 +128,7 @@ impl Peer {
             request_id,
             status,
             body,
+            contexts: Vec::new(),
         };
         if let Err(e) = self.send(msg) {
             eprintln!("[engine] reply failed: {e}");
@@ -433,6 +434,7 @@ fn dispatch(peer: &Arc<Peer>, msg: WireMessage) -> bool {
             request_id,
             status,
             body,
+            ..
         } => {
             // a bidirectional answer the engine was waiting for
             let tx = peer.waits.lock().unwrap().remove(&request_id);
@@ -442,6 +444,7 @@ fn dispatch(peer: &Arc<Peer>, msg: WireMessage) -> bool {
                         request_id,
                         status,
                         body,
+                        contexts: Vec::new(),
                     });
                 }
                 None => eprintln!("[engine] unsolicited reply {request_id}"),

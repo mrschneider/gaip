@@ -185,6 +185,7 @@ mod tests {
                     request_id,
                     status: ReplyStatus::NoException,
                     body: Some(reply_env),
+                    contexts: Vec::new(),
                 })
             }
             _ => None,
@@ -224,6 +225,7 @@ mod tests {
                 request_id,
                 status,
                 body,
+                ..
             } => {
                 assert_eq!(request_id, 9);
                 assert!(status.is_ok());

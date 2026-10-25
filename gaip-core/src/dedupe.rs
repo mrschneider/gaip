@@ -91,6 +91,7 @@ impl DedupeCache {
             request_id: 0,
             status,
             body: None,
+            contexts: Vec::new(),
         };
         self.remember(sender, message_id, msg);
     }

@@ -49,6 +49,7 @@ fn main() {
                 request_id: 7,
                 status: gaip_core::ReplyStatus::NoException,
                 body: Some(reply_env),
+                contexts: Vec::new(),
             };
             publisher
                 .publish("gaip.task.reply", &reply)

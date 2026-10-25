@@ -26,6 +26,9 @@ pub mod id {
     pub const ROUTE: u16 = 0x0006;
     /// comma-separated failover endpoints for the sending participant
     pub const FAILOVER: u16 = 0x0007;
+    /// stamped by the broker that handed a request to a local participant:
+    /// delivery acknowledged, not assumed
+    pub const DELIVERED: u16 = 0x0008;
 }
 
 /// One context entry. `data` is opaque to the protocol; GAIP encodes it

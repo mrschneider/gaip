@@ -124,12 +124,16 @@ pub enum WireMessage {
         contexts: Vec<ServiceContext>,
         body: Envelope,
     },
-    /// The answer to a Request.
+    /// The answer to a Request. Service contexts ride replies too (GIOP
+    /// 1.2): the broker that delivered a request stamps the reply with
+    /// DELIVERED so the origin can tell "acknowledged" from "assumed".
     Reply {
         request_id: u32,
         status: ReplyStatus,
         #[serde(default)]
         body: Option<Envelope>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        contexts: Vec<ServiceContext>,
     },
     /// Cheap liveness/relocation probe, distinct from capability
     /// introspection.
@@ -185,6 +189,7 @@ impl WireMessage {
             request_id,
             status: ReplyStatus::NoException,
             body: Some(body),
+            contexts: Vec::new(),
         }
     }
 
@@ -193,6 +198,7 @@ impl WireMessage {
             request_id,
             status,
             body: None,
+            contexts: Vec::new(),
         }
     }
 
