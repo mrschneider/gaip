@@ -278,7 +278,6 @@ mod checkpoint_tests {
 
     #[test]
     fn an_expired_row_is_not_checkpointed() {
-        let now = Instant::now();
         let mut c = DedupeCache::new(8, Duration::from_millis(50));
         c.remember("urn:agent:a:x:y", "m1", reply("r1"));
         std::thread::sleep(Duration::from_millis(80));
