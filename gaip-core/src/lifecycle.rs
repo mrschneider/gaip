@@ -22,7 +22,7 @@
 //! traffic for that correlation is refused with the state named.
 
 use crate::envelope::{Envelope, MessageType};
-use crate::error::GAIPError;
+use crate::error::GaipError;
 use crate::urn::AgentUrn;
 use std::collections::BTreeMap;
 
@@ -95,7 +95,7 @@ impl TaskRegistry {
 
     /// Apply one envelope to the registry. This is the single gate: a
     /// participant that calls it cannot act on an out-of-order message.
-    pub fn accept(&mut self, env: &Envelope) -> Result<&Task, GAIPError> {
+    pub fn accept(&mut self, env: &Envelope) -> Result<&Task, GaipError> {
         env.validate()?;
         let sender: AgentUrn = env.sender.parse()?;
         let recipient: AgentUrn = env.recipient.parse()?;
@@ -104,7 +104,7 @@ impl TaskRegistry {
         match env.message_type {
             MessageType::TaskRequest => {
                 if self.tasks.contains_key(&id) {
-                    return Err(GAIPError::TaskExists(id));
+                    return Err(GaipError::TaskExists(id));
                 }
                 self.tasks.insert(
                     id.clone(),
@@ -137,14 +137,14 @@ impl TaskRegistry {
             MessageType::TaskStream => {
                 let task = self.task_mut(&id)?;
                 if task.state.is_terminal() {
-                    return Err(GAIPError::IllegalTransition {
+                    return Err(GaipError::IllegalTransition {
                         task: id,
                         from: task.state,
                         primitive: env.message_type,
                     });
                 }
                 if task.state == TaskState::AwaitingHuman {
-                    return Err(GAIPError::IllegalTransition {
+                    return Err(GaipError::IllegalTransition {
                         task: id,
                         from: task.state,
                         primitive: env.message_type,
@@ -166,7 +166,7 @@ impl TaskRegistry {
                         .map(|s| s.eq_ignore_ascii_case("CANCELLED"))
                         .unwrap_or(false);
                     if !ack {
-                        return Err(GAIPError::IllegalTransition {
+                        return Err(GaipError::IllegalTransition {
                             task: id,
                             from: task.state,
                             primitive: env.message_type,
@@ -176,7 +176,7 @@ impl TaskRegistry {
                     return Ok(self.tasks.get(&id).expect("present"));
                 }
                 if task.state.is_terminal() {
-                    return Err(GAIPError::IllegalTransition {
+                    return Err(GaipError::IllegalTransition {
                         task: id,
                         from: task.state,
                         primitive: env.message_type,
@@ -199,7 +199,7 @@ impl TaskRegistry {
             MessageType::CancelRequest => {
                 let task = self.task_mut(&id)?;
                 if task.state.is_terminal() {
-                    return Err(GAIPError::IllegalTransition {
+                    return Err(GaipError::IllegalTransition {
                         task: id,
                         from: task.state,
                         primitive: env.message_type,
@@ -211,7 +211,7 @@ impl TaskRegistry {
             MessageType::HumanIntervent => {
                 let task = self.task_mut(&id)?;
                 if task.state.is_terminal() {
-                    return Err(GAIPError::IllegalTransition {
+                    return Err(GaipError::IllegalTransition {
                         task: id,
                         from: task.state,
                         primitive: env.message_type,
@@ -224,10 +224,10 @@ impl TaskRegistry {
         }
     }
 
-    fn task_mut(&mut self, id: &str) -> Result<&mut Task, GAIPError> {
+    fn task_mut(&mut self, id: &str) -> Result<&mut Task, GaipError> {
         self.tasks
             .get_mut(id)
-            .ok_or_else(|| GAIPError::NoSuchTask(id.to_string()))
+            .ok_or_else(|| GaipError::NoSuchTask(id.to_string()))
     }
 }
 
@@ -280,7 +280,7 @@ mod tests {
         let mut r = TaskRegistry::new();
         r.accept(&req("task_1")).unwrap();
         let err = r.accept(&req("task_1")).unwrap_err();
-        assert!(matches!(err, GAIPError::TaskExists(_)), "{err}");
+        assert!(matches!(err, GaipError::TaskExists(_)), "{err}");
     }
 
     #[test]
@@ -294,7 +294,7 @@ mod tests {
             .accept(&from(&request, MessageType::TaskReply, "m3"))
             .unwrap_err();
         match err {
-            GAIPError::IllegalTransition { from, .. } => {
+            GaipError::IllegalTransition { from, .. } => {
                 assert_eq!(from, TaskState::Cancelled)
             }
             other => panic!("expected IllegalTransition, got {other:?}"),
@@ -326,7 +326,7 @@ mod tests {
             json!({}),
         );
         let err = r.accept(&ghost).unwrap_err();
-        assert!(matches!(err, GAIPError::NoSuchTask(_)), "{err}");
+        assert!(matches!(err, GaipError::NoSuchTask(_)), "{err}");
     }
 
     #[test]
@@ -343,7 +343,7 @@ mod tests {
         let err = r
             .accept(&from(&request, MessageType::TaskStream, "m4"))
             .unwrap_err();
-        assert!(matches!(err, GAIPError::IllegalTransition { .. }), "{err}");
+        assert!(matches!(err, GaipError::IllegalTransition { .. }), "{err}");
 
         // the human decision comes back as a TASK_REPLY
         let resume = from(&request, MessageType::TaskReply, "m5");

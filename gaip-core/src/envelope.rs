@@ -5,7 +5,7 @@
 //! envelope is the only shared contract, and `payload` is the typed body
 //! the schema pins down.
 
-use crate::error::GAIPError;
+use crate::error::GaipError;
 use crate::urn::AgentUrn;
 use crate::PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ impl MessageType {
         }
     }
 
-    pub fn parse(s: &str) -> Result<Self, GAIPError> {
+    pub fn parse(s: &str) -> Result<Self, GaipError> {
         match s {
             "TASK_REQUEST" => Ok(Self::TaskRequest),
             "TASK_REPLY" => Ok(Self::TaskReply),
@@ -62,7 +62,7 @@ impl MessageType {
             "CANCEL_REQUEST" => Ok(Self::CancelRequest),
             "CAPABILITY_QUERY" => Ok(Self::CapabilityQuery),
             "HUMAN_INTERVENT" => Ok(Self::HumanIntervent),
-            other => Err(GAIPError::UnknownPrimitive {
+            other => Err(GaipError::UnknownPrimitive {
                 got: other.to_string(),
                 allowed: Self::ALL,
             }),
@@ -157,20 +157,20 @@ impl Envelope {
 
     /// Full structural validation, in the order a human would ask:
     /// version, identity, addresses, payload shape.
-    pub fn validate(&self) -> Result<(), GAIPError> {
+    pub fn validate(&self) -> Result<(), GaipError> {
         check_version(&self.protocol_version)?;
         for (field, value) in [
             ("message_id", &self.message_id),
             ("correlation_id", &self.correlation_id),
         ] {
             if value.trim().is_empty() {
-                return Err(GAIPError::BadField {
+                return Err(GaipError::BadField {
                     field,
                     why: "must not be empty".to_string(),
                 });
             }
             if value.len() > 128 {
-                return Err(GAIPError::BadField {
+                return Err(GaipError::BadField {
                     field,
                     why: "must be at most 128 characters".to_string(),
                 });
@@ -180,27 +180,27 @@ impl Envelope {
         // does not tell an operator which end of the message is wrong
         for (field, value) in [("sender", &self.sender), ("recipient", &self.recipient)] {
             if let Err(e) = value.parse::<AgentUrn>() {
-                return Err(GAIPError::BadField {
+                return Err(GaipError::BadField {
                     field,
                     why: e.to_string(),
                 });
             }
         }
         if self.sender == self.recipient {
-            return Err(GAIPError::BadField {
+            return Err(GaipError::BadField {
                 field: "recipient",
                 why: "sender and recipient are the same agent".to_string(),
             });
         }
         if !self.payload.is_object() {
-            return Err(GAIPError::PayloadNotObject);
+            return Err(GaipError::PayloadNotObject);
         }
         Ok(())
     }
 
     /// Parse + validate in one step. This is the only entrance a
     /// transport should use: unvalidated envelopes must not exist.
-    pub fn from_json(json: &str) -> Result<Self, GAIPError> {
+    pub fn from_json(json: &str) -> Result<Self, GaipError> {
         let env = Self::from_value(&serde_json::from_str(json)?)?;
         Ok(env)
     }
@@ -208,16 +208,16 @@ impl Envelope {
     /// Deserialize from a `Value` with a precise error for an unknown
     /// primitive (serde's own message would be a generic "unknown
     /// variant", which hides the word the peer actually sent).
-    pub fn from_value(v: &Value) -> Result<Self, GAIPError> {
-        let obj = v.as_object().ok_or_else(|| GAIPError::BadField {
+    pub fn from_value(v: &Value) -> Result<Self, GaipError> {
+        let obj = v.as_object().ok_or_else(|| GaipError::BadField {
             field: "envelope",
             why: "must be a JSON object".to_string(),
         })?;
-        let need = |name: &'static str| -> Result<String, GAIPError> {
+        let need = |name: &'static str| -> Result<String, GaipError> {
             obj.get(name)
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .ok_or(GAIPError::MissingField(name))
+                .ok_or(GaipError::MissingField(name))
         };
         let protocol_version = need("protocol_version")?;
         let message_id = need("message_id")?;
@@ -229,7 +229,7 @@ impl Envelope {
         let payload = obj
             .get("payload")
             .cloned()
-            .ok_or(GAIPError::MissingField("payload"))?;
+            .ok_or(GaipError::MissingField("payload"))?;
 
         let env = Self {
             protocol_version,
@@ -258,8 +258,8 @@ impl Envelope {
 /// Accept `1.x` for the current major, refuse anything else. Minor
 /// versions are additive by contract; a major bump means the envelope
 /// layout changed and a peer that guesses will corrupt a task.
-pub fn check_version(got: &str) -> Result<(), GAIPError> {
-    let bad = || GAIPError::VersionMismatch {
+pub fn check_version(got: &str) -> Result<(), GaipError> {
+    let bad = || GaipError::VersionMismatch {
         got: got.to_string(),
         expected: PROTOCOL_VERSION,
     };
@@ -329,7 +329,7 @@ mod tests {
     fn framework_specific_event_names_are_refused() {
         for invented in ["AGENT_STEP", "on_tool_start", "RUN_COMPLETION", ""] {
             match MessageType::parse(invented) {
-                Err(GAIPError::UnknownPrimitive { got, allowed }) => {
+                Err(GaipError::UnknownPrimitive { got, allowed }) => {
                     assert_eq!(got, invented);
                     assert_eq!(allowed.len(), 6);
                 }
@@ -358,7 +358,7 @@ mod tests {
         assert!(env.validate().is_ok(), "minor versions are compatible");
         env.protocol_version = "2.0".into();
         let err = env.validate().unwrap_err();
-        assert!(matches!(err, GAIPError::VersionMismatch { .. }), "{err}");
+        assert!(matches!(err, GaipError::VersionMismatch { .. }), "{err}");
         env.protocol_version = "one".into();
         assert!(env.validate().is_err());
     }
@@ -391,7 +391,7 @@ mod tests {
             let text = err.to_string();
             match field {
                 "payload" => assert!(
-                    matches!(err, GAIPError::PayloadNotObject),
+                    matches!(err, GaipError::PayloadNotObject),
                     "payload case: {text}"
                 ),
                 _ => assert!(text.contains(field), "'{field}' not named in '{text}'"),
@@ -430,6 +430,6 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(&text).is_err());
         // the GAIP path gives the better error
         let err = Envelope::from_json(&text).unwrap_err();
-        assert!(matches!(err, GAIPError::UnknownPrimitive { .. }));
+        assert!(matches!(err, GaipError::UnknownPrimitive { .. }));
     }
 }

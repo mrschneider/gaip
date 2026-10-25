@@ -15,10 +15,10 @@
 //! `\n` — exactly the rule in the WHATWG spec.
 
 use crate::envelope::Envelope;
-use crate::error::GAIPError;
+use crate::error::GaipError;
 
 /// Render one envelope as one SSE event, ready to write to the response.
-pub fn encode_event(env: &Envelope) -> Result<String, GAIPError> {
+pub fn encode_event(env: &Envelope) -> Result<String, GaipError> {
     env.validate()?;
     let json = serde_json::to_string_pretty(env)?;
     let mut out = String::new();
@@ -43,7 +43,7 @@ pub fn keepalive() -> &'static str {
 
 /// Parse one SSE event (the `event:`/`data:` block) back into an
 /// envelope. Returns `Ok(None)` for comment-only blocks.
-pub fn decode_event(block: &str) -> Result<Option<Envelope>, GAIPError> {
+pub fn decode_event(block: &str) -> Result<Option<Envelope>, GaipError> {
     let mut event: Option<String> = None;
     let mut data = String::new();
     for raw in block.lines() {
@@ -69,7 +69,7 @@ pub fn decode_event(block: &str) -> Result<Option<Envelope>, GAIPError> {
     // disagree, the frame has been tampered with or mis-framed
     if let Some(name) = event {
         if name != env.message_type.as_str() {
-            return Err(GAIPError::BadField {
+            return Err(GaipError::BadField {
                 field: "event",
                 why: format!(
                     "SSE event '{name}' disagrees with message_type '{}'",

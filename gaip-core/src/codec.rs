@@ -10,18 +10,19 @@
 //! the length prefix and carry the JSON as the message body.
 
 use crate::envelope::{check_version, Envelope};
-use crate::error::GAIPError;
+use crate::error::GaipError;
+use crate::message::{ReplyStatus, SystemMinor, WireMessage};
 
 /// 8 MiB. An agent payload above this is an artifact, and artifacts
 /// travel by reference (`artifacts_ref`), not inline.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 /// Encode one envelope as a length-prefixed frame.
-pub fn encode_frame(env: &Envelope) -> Result<Vec<u8>, GAIPError> {
+pub fn encode_frame(env: &Envelope) -> Result<Vec<u8>, GaipError> {
     env.validate()?;
     let body = serde_json::to_vec(env)?;
     if body.len() > MAX_FRAME {
-        return Err(GAIPError::FrameTooLarge(body.len()));
+        return Err(GaipError::FrameTooLarge(body.len()));
     }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -35,19 +36,19 @@ pub fn encode_frame(env: &Envelope) -> Result<Vec<u8>, GAIPError> {
 /// * `Ok(None)` — need more bytes.
 /// * `Err(_)` — refuse with the reason (bad length, bad JSON, unknown
 ///   primitive, version mismatch...).
-pub fn decode_frame(buf: &[u8]) -> Result<Option<(Envelope, usize)>, GAIPError> {
+pub fn decode_frame(buf: &[u8]) -> Result<Option<(Envelope, usize)>, GaipError> {
     if buf.len() < 4 {
         return Ok(None);
     }
     let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if len == 0 {
-        return Err(GAIPError::BadField {
+        return Err(GaipError::BadField {
             field: "frame",
             why: "zero-length frame".to_string(),
         });
     }
     if len > MAX_FRAME {
-        return Err(GAIPError::FrameTooLarge(len));
+        return Err(GaipError::FrameTooLarge(len));
     }
     if buf.len() < 4 + len {
         return Ok(None);
@@ -57,8 +58,64 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Envelope, usize)>, GAIPError> 
     Ok(Some((env, 4 + len)))
 }
 
+/// Encode a wire message as a length-prefixed frame.
+pub fn encode_wire(msg: &WireMessage) -> Result<Vec<u8>, GaipError> {
+    let body = serde_json::to_vec(msg)?;
+    if body.len() > MAX_FRAME {
+        return Err(GaipError::FrameTooLarge(body.len()));
+    }
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Decode one wire message. An unparseable frame yields a
+/// `MessageError`-worthy [`GaipError`]; the caller decides whether to
+/// answer with `WireMessage::MessageError` (GIOP does exactly that
+/// instead of dropping the connection).
+pub fn decode_wire(buf: &[u8]) -> Result<Option<(WireMessage, usize)>, GaipError> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len == 0 {
+        return Err(GaipError::BadField {
+            field: "frame",
+            why: "zero-length frame".to_string(),
+        });
+    }
+    if len > MAX_FRAME {
+        return Err(GaipError::FrameTooLarge(len));
+    }
+    if buf.len() < 4 + len {
+        return Ok(None);
+    }
+    let msg = serde_json::from_slice::<WireMessage>(&buf[4..4 + len])?;
+    // re-validate the embedded envelope
+    let msg = WireMessage::from_json(&serde_json::to_string(&msg)?)?;
+    Ok(Some((msg, 4 + len)))
+}
+
+/// A refusal expressed as a wire message (GIOP's MessageError) rather
+/// than an ad-hoc object outside the contract.
+pub fn message_error(reason: impl Into<String>) -> WireMessage {
+    WireMessage::MessageError {
+        reason: reason.into(),
+    }
+}
+
+/// A system exception reply for a failed request.
+pub fn system_reply(
+    request_id: u32,
+    minor: SystemMinor,
+    message: impl Into<String>,
+) -> WireMessage {
+    WireMessage::reply_with(request_id, ReplyStatus::system(minor, message))
+}
+
 /// Parse a bare JSON envelope (message-oriented bindings: Kafka/NATS/SSE).
-pub fn decode_json(text: &str) -> Result<Envelope, GAIPError> {
+pub fn decode_json(text: &str) -> Result<Envelope, GaipError> {
     Envelope::from_json(text)
 }
 
@@ -70,10 +127,10 @@ pub fn probe_version(text: &str) -> Option<String> {
 }
 
 /// Is this peer speaking a version we can serve?
-pub fn version_compatible(text: &str) -> Result<(), GAIPError> {
+pub fn version_compatible(text: &str) -> Result<(), GaipError> {
     match probe_version(text) {
         Some(v) => check_version(&v),
-        None => Err(GAIPError::MissingField("protocol_version")),
+        None => Err(GaipError::MissingField("protocol_version")),
     }
 }
 
@@ -140,7 +197,7 @@ mod tests {
         let huge = (MAX_FRAME as u32 + 1).to_be_bytes();
         assert!(matches!(
             decode_frame(&huge).unwrap_err(),
-            GAIPError::FrameTooLarge(_)
+            GaipError::FrameTooLarge(_)
         ));
         let zero = 0u32.to_be_bytes();
         assert!(

@@ -1,0 +1,21 @@
+// GAIP interface repository — the declared shape of every intent payload.
+//
+// A peer validates an inbound payload against this before touching it.
+// Unknown fields are drift and are refused; adding a field means a new
+// minor version of the intent.
+
+intent INVENTORY_OPTIMIZATION version 1.0 {
+  facility_id: int
+  horizon_days: int
+  artifacts_ref: [string]
+  note: string?
+}
+
+intent DEMAND_FORECAST version 1.0 {
+  sku: string
+  horizon_days: int
+}
+
+intent FETCH_CONTEXT version 1.0 {
+  key: string
+}

@@ -47,6 +47,42 @@ the normative JSON-Schema):
   A peer that guesses at a changed layout corrupts a task.
 * Payloads stay typed. Big artifacts travel by reference, not inline.
 
+## The GIOP layer: message types around the primitives
+
+The six primitives are *operations*. GIOP's second lesson is that the
+**transport message** is a separate thing from the operation it carries,
+and that separation is what makes the rest work:
+
+```
+WireMessage
+├── Request        { request_id, service_contexts, body: Envelope }
+├── Reply          { request_id, status, body: Envelope? }
+├── LocateRequest  { request_id, target }
+├── LocateReply    { request_id, status: ObjectHere | ObjectForward(Ior) | UnknownObject }
+├── CancelRequest  { request_id }        (transport abort, not the CANCEL primitive)
+├── MessageError   { reason }
+├── CloseConnection
+└── Fragment       { request_id, fragment_num, more, data }
+```
+
+| Mechanism | What it buys an agent system |
+|---|---|
+| **Fragment** (GIOP 1.1 style) | a 3000-char context or a token burst travels as numbered fragments, reassembled byte-exactly; a gap or a reordered run is refused |
+| **Service contexts** | `trace`, `tenant`, `deadline`, `identity`, `attempt`, `route` ride every message — a gateway can add a trace id to traffic it does not understand |
+| **LocateRequest / OBJECT_FORWARD** | cheap liveness distinct from capability introspection, and relocation: an agent that moved hands back a reference instead of a failure |
+| **Exception model** | `NO_EXCEPTION` / `USER_EXCEPTION` / `SYSTEM_EXCEPTION` with a `retryable` flag — a poisoned message is never retried forever |
+| **MessageError / CloseConnection** | a refusal expressed *in* the protocol and a clean shutdown, instead of an ad-hoc `{"error": ...}` object |
+| **IOR + corbaloc** | one portable reference: URN, failover endpoints, version, capabilities |
+| **Naming Service** | `swarm/backend/engine-1` → reference, rebindable when the agent is replaced |
+| **Trader** | discovery by attribute (`capability` + `vram_free_mb >= 32000` + runtime), not by name |
+| **IDL + Interface Repository** | payloads declared per intent, validated before the work starts; an undeclared field is drift and is refused |
+| **Bidirectional GIOP** | the server calls back over the client's own connection mid-task (NAT-friendly) |
+| **Policies** | `sync_scope`, absolute deadlines that no hop may extend, fragment bounds |
+| **CSIv2** | signed identity assertion with roles and delegation, verified before any work |
+
+Deadlines are **absolute** on purpose: a queue in the middle cannot
+silently extend the caller's budget.
+
 ## Six primitives — and nothing else
 
 | Message type | Purpose |
@@ -125,48 +161,62 @@ JSON, read the same back. That boringness is intentional.
 
 ## Verified results
 
-`python3 experiments/experiment_001_primitives.py` — a Python orchestrator
-against the Rust engine over the real TCP binding:
+`python3 experiments/experiment_001_giop_layer.py` — a Python
+orchestrator against the Rust engine over the real TCP binding, covering
+all ten mechanisms:
 
 ```
-PASS: introspection: CAPABILITY_QUERY is answered with a typed TASK_REPLY
-PASS: introspection: the answer is correlated to the query
-PASS: lifecycle: TASK_REQUEST produces three TASK_STREAM frames
-PASS: lifecycle: then exactly one TASK_REPLY
-PASS: typing: every frame carries the same correlation_id
-PASS: typing: the reply carries the typed result, not prose
-PASS: addressing: the reply is sent back to the requester URN
-PASS: cancel: the task starts streaming before we abort it
-PASS: cancel: CANCEL_REQUEST is acknowledged with status CANCELLED
-PASS: cancel: no further frames arrive for the aborted task
-PASS: human: a risky task raises HUMAN_INTERVENT before computing
-PASS: human: the intervention names what is being approved
-PASS: human: the task does not run while it waits
-PASS: human: the decision resumes the work (streams continue)
-PASS: human: and the task then completes normally
-PASS: drift: a framework-specific verb is refused, naming the word
-PASS: drift: the refusal lists the six legal primitives
-PASS: version: protocol_version 2.0 is refused
-PASS: version: a 1.x minor version is accepted (additive by contract)
-PASS: addressing: a message addressed to another participant is refused
+PASS: contexts: the trace id survives the hop and is echoed back
+PASS: contexts: tenant and attempt reach the engine too
+PASS: contexts: the engine appended itself to the route
+PASS: idl: the capability reply publishes the intent schemas from the IR
+PASS: idl: field types come from the declaration, not from guessing
+PASS: ior: the peer hands back a parseable reference
+PASS: naming: a name resolves to the reference without hardcoding an endpoint
+PASS: naming: the corbaloc short form addresses the same reference
+PASS: locate: the object is here
+PASS: locate: a relocated agent answers OBJECT_FORWARD with a reference
+PASS: locate: an unknown agent answers UnknownObject
+PASS: exceptions: an undeclared payload field is a USER exception naming the drift
+PASS: exceptions: a user exception is not retryable
+PASS: policies: an expired deadline refuses the work instead of starting it late
+PASS: policies: the timeout is marked retryable (the caller knows to retry)
+PASS: fragment: the oversized request was fragmented and reassembled by the engine
+PASS: lifecycle: three stream replies carried progress
+PASS: fragment: the oversized reply came back whole (reassembled by us)
+PASS: bidirectional: the engine asked US for context mid-task and used the answer
+PASS: bidirectional: the callback carried a correlation of its own
+PASS: contexts: the route shows the engine hop on the task reply
+PASS: csi2: a correctly signed identity with the executor role is accepted
+PASS: csi2: a TASK_REQUEST without an identity is refused
+PASS: csi2: a signed identity without the required role is refused
+PASS: csi2: a tampered role breaks the signature and is refused
+PASS: csi2: an expired identity token is refused
+PASS: exceptions: a malformed frame is answered with a MessageError in-protocol
+PASS: exceptions: CloseConnection ends the session without a reply
 
-20 passed, 0 failed
+28 passed, 0 failed
 EXPERIMENT_001: PASS
 ```
 
-Unit tests: `cargo test --workspace` → **34 passed** (envelope round-trip
-of the spec's own example, URN parsing, closed-vocabulary refusal,
-version policy, lifecycle transitions incl. cancel-ack and human resume,
-frame codec with partial/hostile buffers, SSE encode/decode).
+Unit tests: `cargo test --workspace` → **86 passed**: envelope round-trip
+of the spec's example, URN and IOR/corbaloc parsing, closed-vocabulary
+refusal, version policy, lifecycle (cancel-ack, human resume), message
+fragmentation/reassembly (gaps, reorder, mixed runs refused), service
+contexts (absolute deadlines, bounded route), IDL parsing and IR
+validation (drift, types, optional fields), naming, trader queries,
+policies and CSIv2 (tamper, forged role, expiry, delegation).
 
 ## Layout
 
 ```
-gaip-core/      the contract: envelope, primitives, lifecycle, codec, SSE
-                (no IO at all)
+gaip-core/      the contract (no IO at all): envelope, primitives,
+                lifecycle, codec, SSE, message layer, contexts, IOR,
+                naming, trader, IDL+IR, policies, CSIv2
 gaip-engine/    reference participant: a Rust engine speaking the six
                 primitives over the framed TCP binding
-schema/         gaip-envelope.schema.json — the normative wire contract
+schema/         gaip-envelope.schema.json (wire contract) and
+                intents.idl (payload declarations served by the IR)
 experiments/    runnable end-to-end proof (a Python peer on purpose:
                 the point is cross-runtime interop)
 ```
@@ -182,8 +232,17 @@ experiments/    runnable end-to-end proof (a Python peer on purpose:
   no message broker, no discovery service, no retry.
 * **Exactly-once delivery** — `message_id` exists for deduplication but
   the reference participant does not dedupe; at-least-once at best.
-* **Payload schema registry** — `payload` is `object`; per-intent
-  schemas (`INVENTORY_OPTIMIZATION` etc.) are not published yet.
+* **Dynamic schema distribution** — the IR is served over
+  `CAPABILITY_QUERY` and validated locally; there is no registry that
+  pushes new intents to peers.
+* **Full CSIv2** — the identity assertion, roles and delegation are
+  implemented and verified; the transport half (TLS/GSSAPI) is not. Run
+  it inside mTLS.
+* **Trader query language** — constraints are a conjunction of typed
+  predicates (capability, runtime, version prefix, numeric minimum, text
+  equality), not an expression language.
+* **Multi-broker routing** — `OBJECT_FORWARD` hands back a reference;
+  following it across brokers is the caller's job.
 * **Backpressure** — a slow peer blocks its writer; no flow control.
 
 ## License

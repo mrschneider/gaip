@@ -9,7 +9,7 @@ use crate::lifecycle::TaskState;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GAIPError {
+pub enum GaipError {
     /// A verb outside the six universal primitives. This is the protocol's
     /// whole point: framework-specific event names do not travel.
     UnknownPrimitive {
@@ -45,7 +45,7 @@ pub enum GAIPError {
     Json(String),
 }
 
-impl fmt::Display for GAIPError {
+impl fmt::Display for GaipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownPrimitive { got, allowed } => write!(
@@ -80,9 +80,9 @@ impl fmt::Display for GAIPError {
     }
 }
 
-impl std::error::Error for GAIPError {}
+impl std::error::Error for GaipError {}
 
-impl From<serde_json::Error> for GAIPError {
+impl From<serde_json::Error> for GaipError {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e.to_string())
     }

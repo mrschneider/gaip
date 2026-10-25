@@ -7,7 +7,7 @@
 //! framework: when a Java connector starts misrouting, the first question
 //! is "which participant is that", and the answer is in the address.
 
-use crate::error::GAIPError;
+use crate::error::GaipError;
 use std::fmt;
 use std::str::FromStr;
 
@@ -32,7 +32,7 @@ impl AgentUrn {
         framework: impl Into<String>,
         name: impl Into<String>,
         version: Option<impl Into<String>>,
-    ) -> Result<Self, GAIPError> {
+    ) -> Result<Self, GaipError> {
         let urn = Self {
             runtime: runtime.into(),
             framework: framework.into(),
@@ -43,14 +43,14 @@ impl AgentUrn {
         Ok(urn)
     }
 
-    fn validate(&self) -> Result<(), GAIPError> {
+    fn validate(&self) -> Result<(), GaipError> {
         for (label, seg) in [
             ("runtime", &self.runtime),
             ("framework", &self.framework),
             ("name", &self.name),
         ] {
             if !valid_segment(seg) {
-                return Err(GAIPError::BadUrn {
+                return Err(GaipError::BadUrn {
                     value: self.to_string(),
                     why: format!("{label} segment '{seg}' must be 1-64 chars of [A-Za-z0-9._-]"),
                 });
@@ -58,7 +58,7 @@ impl AgentUrn {
         }
         if let Some(v) = &self.version {
             if !valid_segment(v) {
-                return Err(GAIPError::BadUrn {
+                return Err(GaipError::BadUrn {
                     value: self.to_string(),
                     why: format!("version segment '{v}' is not a valid token"),
                 });
@@ -76,10 +76,10 @@ impl AgentUrn {
 }
 
 impl FromStr for AgentUrn {
-    type Err = GAIPError;
+    type Err = GaipError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bad = |why: &str| GAIPError::BadUrn {
+        let bad = |why: &str| GaipError::BadUrn {
             value: s.to_string(),
             why: why.to_string(),
         };

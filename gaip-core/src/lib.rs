@@ -38,15 +38,31 @@
 //! ```
 
 pub mod codec;
+pub mod context;
 pub mod envelope;
 pub mod error;
+pub mod idl;
+pub mod ior;
 pub mod lifecycle;
+pub mod message;
+pub mod naming;
+pub mod policy;
+pub mod security;
 pub mod sse;
+pub mod trader;
 pub mod urn;
 
+pub use context::{ContextList, ServiceContext};
 pub use envelope::{Envelope, MessageType};
-pub use error::GAIPError;
+pub use error::GaipError;
+pub use idl::{FieldKind, InterfaceRepository, TypeSpec};
+pub use ior::Ior;
 pub use lifecycle::{TaskRegistry, TaskState};
+pub use message::{LocateStatus, ReplyStatus, SystemMinor, WireMessage};
+pub use naming::NamingService;
+pub use policy::{Policies, SyncScope};
+pub use security::{Credentials, IdentityAssertion};
+pub use trader::{Offer, Query, Trader};
 pub use urn::AgentUrn;
 
 /// The only protocol version this crate speaks. A message carrying a
