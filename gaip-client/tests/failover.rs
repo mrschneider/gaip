@@ -1,9 +1,8 @@
 //! The client against a real engine process: failover, cursor resume,
 //! credits.
 
-use gaip_client::{Client, ClientInterceptor, Recorder};
+use gaip_client::{Client, Recorder};
 use gaip_core::message::WireMessage;
-use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
