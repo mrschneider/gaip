@@ -27,7 +27,6 @@ use gaip_core::context::ContextList;
 use gaip_core::dedupe::DedupeCache;
 use gaip_core::flow::{FlowError, Outbox};
 use gaip_core::message::{ReplyStatus, SystemMinor, WireMessage};
-use gaip_core::Envelope;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -526,12 +525,3 @@ impl Broker {
     }
 }
 
-fn describe(b: &Broker) -> Envelope {
-    Envelope::task_request(
-        "msg_broker",
-        "task_broker",
-        b.urn.clone(),
-        b.urn.clone(),
-        serde_json::json!({"role": "broker"}),
-    )
-}
