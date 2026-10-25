@@ -334,7 +334,11 @@ fn serve(peer: Arc<Peer>, io: Io) {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                continue
+                // STARVATION FIX: without this window the reader wins the
+                // lock race every 100 ms and a queued reply waits for the
+                // NEXT request — measured: a reply delayed a full second
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
             }
             Err(_) => return,
         }
@@ -487,15 +491,22 @@ fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContex
     ctx.push_route("engine-v1");
     // interceptor: before dispatch, with the right to annotate the context
     peer.recorder.receive_request(&mut ctx, &env);
-    // the run telemetry channel: task starts and outcomes are events with
-    // QoS, never silent drops
-    if env.message_type == MessageType::TaskRequest {
+    // the run telemetry channel: task starts are events with QoS. The
+    // operational intents (locks, event pulls) are not tasks and must not
+    // pollute the channel — otherwise every pull would feed itself.
+    let intent_name = env
+        .payload
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let is_operational = matches!(intent_name, "LOCK_ACQUIRE" | "LOCK_RELEASE" | "EVENT_PULL");
+    if env.message_type == MessageType::TaskRequest && !is_operational {
         let mut ev = peer.events.lock().unwrap();
         let _ = ev.publish(
             "task_started",
             serde_json::json!({
                 "correlation_id": env.correlation_id,
-                "intent": env.payload.get("intent").and_then(Value::as_str).unwrap_or(""),
+                "intent": intent_name,
             }),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
