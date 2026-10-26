@@ -109,9 +109,26 @@ impl TypeSpec {
     /// thing the protocol exists to stop. A peer that needs a new field
     /// bumps the intent's version.
     pub fn validate(&self, payload: &serde_json::Value) -> Result<(), GaipError> {
+        self.validate_except(payload, None)
+    }
+
+    /// [`TypeSpec::validate`], ignoring one reserved key entirely — both
+    /// as a declared field and as drift. Lets the `intent` discriminator
+    /// be stripped without cloning the payload (the hot path paid a deep
+    /// clone per TASK_REQUEST before).
+    pub fn validate_except(
+        &self,
+        payload: &serde_json::Value,
+        skip: Option<&str>,
+    ) -> Result<(), GaipError> {
         let obj = payload.as_object().ok_or(GaipError::PayloadNotObject)?;
         for f in &self.fields {
-            match obj.get(&f.name) {
+            let declared = if skip == Some(f.name.as_str()) {
+                None
+            } else {
+                obj.get(&f.name)
+            };
+            match declared {
                 None if f.optional => {}
                 None => {
                     return Err(GaipError::BadField {
@@ -142,6 +159,9 @@ impl TypeSpec {
             }
         }
         for key in obj.keys() {
+            if skip == Some(key) {
+                continue;
+            }
             if self.field(key).is_none() {
                 return Err(GaipError::BadField {
                     field: "payload",
@@ -292,13 +312,10 @@ impl InterfaceRepository {
     ) -> Result<(), GaipError> {
         // `intent` is the DISCRIMINATOR (which schema applies), not a
         // declared field: validating it as an unknown field would refuse
-        // every well-formed request
-        let mut body = payload.clone();
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("intent");
-        }
+        // every well-formed request. validate_except skips it in place —
+        // no deep clone of the payload on the per-message hot path.
         match self.lookup_compatible(intent, version) {
-            Some(spec) => spec.validate(&body),
+            Some(spec) => spec.validate_except(payload, Some("intent")),
             None => Err(GaipError::BadField {
                 field: "payload",
                 why: format!("no schema registered for intent '{intent}' v{version}"),

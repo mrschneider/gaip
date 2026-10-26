@@ -60,7 +60,13 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Envelope, usize)>, GaipError> 
 
 /// Encode a wire message as a length-prefixed frame.
 pub fn encode_wire(msg: &WireMessage) -> Result<Vec<u8>, GaipError> {
-    let body = serde_json::to_vec(msg)?;
+    encode_body(serde_json::to_vec(msg)?)
+}
+
+/// Wrap an already-serialized body in a frame. Callers that measured the
+/// message from their own serialization hand that body here instead of
+/// paying for a second `serde_json::to_vec`.
+pub fn encode_body(body: Vec<u8>) -> Result<Vec<u8>, GaipError> {
     if body.len() > MAX_FRAME {
         return Err(GaipError::FrameTooLarge(body.len()));
     }
@@ -92,8 +98,8 @@ pub fn decode_wire(buf: &[u8]) -> Result<Option<(WireMessage, usize)>, GaipError
         return Ok(None);
     }
     let msg = serde_json::from_slice::<WireMessage>(&buf[4..4 + len])?;
-    // re-validate the embedded envelope
-    let msg = WireMessage::from_json(&serde_json::to_string(&msg)?)?;
+    // validate the embedded envelope in place — no re-encode/re-parse
+    msg.validate_envelopes()?;
     Ok(Some((msg, 4 + len)))
 }
 

@@ -13,7 +13,7 @@
 //!   mid-task over the same connection),
 //! * deadlines that refuse work instead of starting it late.
 
-use gaip_core::codec::{decode_wire, encode_wire};
+use gaip_core::codec::{decode_wire, encode_body, encode_wire};
 use gaip_core::context::{now_ms, ContextList, ServiceContext};
 use gaip_core::flow::Outbox;
 use gaip_core::idl::InterfaceRepository;
@@ -90,7 +90,13 @@ impl Peer {
     }
 
     fn send_raw(&self, msg: &WireMessage) -> Result<(), GaipError> {
-        let bytes = encode_wire(msg)?;
+        self.send_encoded(encode_wire(msg)?)
+    }
+
+    /// Queue an already-framed message — the small-message path measured
+    /// size from its own body and hands those exact bytes to the outbox
+    /// instead of paying for a second serialization.
+    fn send_encoded(&self, bytes: Vec<u8>) -> Result<(), GaipError> {
         match self.out.send(bytes) {
             Ok(()) => Ok(()),
             // BACKPRESSURE: the peer is not draining. This becomes a
@@ -108,7 +114,10 @@ impl Peer {
 
     /// Send, fragmenting when the message exceeds the policy size.
     fn send(&self, msg: WireMessage) -> Result<(), GaipError> {
-        let json_len = msg.to_json()?.len();
+        // one serialization: the body is produced once, used for the
+        // size check and (small path) as the frame itself
+        let body = serde_json::to_vec(&msg)?;
+        let json_len = body.len();
         if json_len > self.policies.fragment_size {
             self.policies.check_size(json_len)?;
             for f in msg.fragment(self.policies.fragment_size)? {
@@ -116,7 +125,7 @@ impl Peer {
             }
             return Ok(());
         }
-        self.send_raw(&msg)
+        self.send_encoded(encode_body(body)?)
     }
 
     fn reply(&self, request_id: u32, status: ReplyStatus, body: Option<Envelope>) {

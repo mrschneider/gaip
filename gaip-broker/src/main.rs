@@ -80,37 +80,20 @@ impl Broker {
         self.local.get(urn).cloned()
     }
 
-    fn send(&self, conn: &Arc<Conn>, msg: &WireMessage) -> Result<(), FlowError> {
+    /// Every peer-broker connection (resolution only — the caller
+    /// serializes and sends after releasing the lock).
+    fn peer_conns(&self) -> Vec<Arc<Conn>> {
+        self.peers.clone()
+    }
+
+    /// Encode + enqueue on one connection. An associated function, not a
+    /// method: callers hold `Arc<Conn>` and must serialize OUTSIDE the
+    /// `shared` mutex — the encode never waits on the global lock.
+    fn send_to(conn: &Arc<Conn>, msg: &WireMessage) -> Result<(), FlowError> {
         match encode_wire(msg) {
             Ok(bytes) => conn.out.send(bytes),
             Err(_) => Err(FlowError::Closed),
         }
-    }
-
-    /// Forward a request to a target on this broker. Returns the id of
-    /// the connection it was handed to.
-    fn forward_local(&self, target: &str, msg: &WireMessage) -> Option<u64> {
-        match self.conn_for(target) {
-            Some(c) => {
-                if self.send(&c, msg).is_ok() {
-                    Some(c.id)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        }
-    }
-
-    /// Broadcast to peers; returns the connections that accepted.
-    fn forward_peers(&self, msg: &WireMessage) -> Vec<u64> {
-        let mut ids = Vec::new();
-        for p in &self.peers {
-            if self.send(p, msg).is_ok() {
-                ids.push(p.id);
-            }
-        }
-        ids
     }
 }
 
@@ -384,6 +367,9 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     contexts: reply_contexts,
                 }
             };
+            // state under the lock, serialization outside it: the encode
+            // of the reply must not sit in the queue of the global mutex
+            let mut target_conn = None;
             {
                 // exactly-once: remember the reply against the request
                 // that caused it, using the (connection, request_id) the
@@ -396,10 +382,11 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                 // state, no request-id bookkeeping
                 if let Some(env) = &body {
                     let target = env.recipient.clone();
-                    if b.forward_local(&target, &reply).is_some() {
-                        return true;
-                    }
+                    target_conn = b.conn_for(&target);
                 }
+            }
+            if let Some(c) = target_conn {
+                let _ = Broker::send_to(&c, &reply);
             }
             true
         }
@@ -428,7 +415,8 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     status: gaip_core::LocateStatus::UnknownObject,
                 }
             };
-            let _ = b.send(conn, &reply);
+            drop(b);
+            let _ = Broker::send_to(conn, &reply);
             true
         }
 
@@ -474,7 +462,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     body: None,
                     contexts: Vec::new(),
                 };
-                let _ = shared.lock().unwrap().send(conn, &reply);
+                let _ = Broker::send_to(conn, &reply);
                 return true;
             }
             ctx.push_route(&own);
@@ -492,7 +480,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     body,
                     contexts: Vec::new(),
                 };
-                let _ = shared.lock().unwrap().send(conn, &reply);
+                let _ = Broker::send_to(conn, &reply);
                 return true;
             }
 
@@ -519,7 +507,8 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     let mut b = shared.lock().unwrap();
                     b.dedupe
                         .remember(&body.sender, &body.message_id, reply.clone());
-                    let _ = b.send(conn, &reply);
+                    drop(b);
+                    let _ = Broker::send_to(conn, &reply);
                     return true;
                 }
             }
@@ -549,7 +538,8 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     SystemMinor::ObjectNotExist,
                     format!("{target} was recently unreachable; retry after the negative-cache window"),
                 ));
-                let _ = b.send(conn, &reply);
+                drop(b);
+                let _ = Broker::send_to(conn, &reply);
                 return true;
             }
 
@@ -560,26 +550,31 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             };
             let mut delivered = false;
             for attempt in 0..=retries {
-                let conns = {
+                let conns: Vec<Arc<Conn>> = {
                     let mut b = shared.lock().unwrap();
-                    let mut used: Vec<u64> = Vec::new();
+                    let mut used: Vec<Arc<Conn>> = Vec::new();
                     let mut flooded_here = false;
-                    if let Some(id) = b.forward_local(&target, &fwd) {
-                        used.push(id);
+                    if let Some(c) = b.conn_for(&target) {
+                        used.push(c);
                     } else {
-                        used = b.forward_peers(&fwd);
+                        used = b.peer_conns();
                         flooded_here = !used.is_empty();
                     }
                     if !used.is_empty() {
-                        for id in &used {
+                        for c in &used {
                             b.pending.insert(
-                                (*id, request_id),
+                                (c.id, request_id),
                                 (body.sender.clone(), body.message_id.clone(), !flooded_here),
                             );
                         }
                     }
                     used
                 };
+                // serialize + enqueue outside the lock: the encode of the
+                // forwarded request is the broker's hottest path
+                for c in &conns {
+                    let _ = Broker::send_to(c, &fwd);
+                }
                 if !conns.is_empty() {
                     delivered = true;
                     break;
@@ -615,7 +610,8 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                 };
                 b.dedupe
                     .remember(&body.sender, &body.message_id, reply.clone());
-                let _ = b.send(conn, &reply);
+                drop(b);
+                let _ = Broker::send_to(conn, &reply);
             }
             true
         }
@@ -633,8 +629,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             let msg = WireMessage::SchemaSync { idl, contexts };
             let local: Vec<Arc<Conn>> = shared.lock().unwrap().local.values().cloned().collect();
             for c in local {
-                let b = shared.lock().unwrap();
-                let _ = b.send(&c, &msg);
+                let _ = Broker::send_to(&c, &msg);
             }
             true
         }

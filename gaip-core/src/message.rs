@@ -226,16 +226,23 @@ impl WireMessage {
 
     pub fn from_json(text: &str) -> Result<Self, GaipError> {
         let msg: Self = serde_json::from_str(text)?;
-        // the embedded envelope must still validate: the wire layer is not
-        // a way to smuggle an invalid GAIP message past the contract
-        match &msg {
+        msg.validate_envelopes()?;
+        Ok(msg)
+    }
+
+    /// The embedded envelope must still validate: the wire layer is not
+    /// a way to smuggle an invalid GAIP message past the contract.
+    /// Runs on an already-deserialized message so transports validate in
+    /// place instead of re-encoding the frame just to re-parse it.
+    pub fn validate_envelopes(&self) -> Result<(), GaipError> {
+        match self {
             Self::Request { body, .. } => body.validate()?,
             Self::Reply {
                 body: Some(body), ..
             } => body.validate()?,
             _ => {}
         }
-        Ok(msg)
+        Ok(())
     }
 
     /// Split an over-sized message into `Fragment`s whose JSON payload is
