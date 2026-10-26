@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
 [![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
-[![Crates.io-style version](https://img.shields.io/badge/version-0.5.0-blue.svg)](releases)
+[![Crates.io-style version](https://img.shields.io/badge/version-0.5.1-blue.svg)](releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Python/LangGraph planner, a Java Spring service and a Rust execution
@@ -44,7 +44,7 @@ with one translator per framework pair.
 
 | | |
 |---|---|
-| **6 transports, one contract** | framed TCP, SSE, TLS 1.3, gRPC/HTTP/2, NATS — payloads never change with the wire |
+| **5 transports, one contract** | framed TCP, SSE, TLS 1.3, gRPC/HTTP/2, NATS — payloads never change with the wire |
 | **Exactly-once across restarts** | the broker checkpoints its dedupe window on SIGTERM; a restarted exchange replays identically, no re-execution |
 | **At-least-once, acknowledged** | the broker stamps `DELIVERED` on what it actually handed to a participant; dead letters are journaled with the reason |
 | **References that survive crashes** | an IOR with failover endpoints; a Locate for a dead participant answers `OBJECT_FORWARD` with where it can still be reached |
@@ -54,6 +54,7 @@ with one translator per framework pair.
 | **Signed schema pushes** | IDL updates ride a verified CSIv2 identity — a poisoned declaration is a refusal |
 | **Interceptors** | server- and client-side hooks for tracing, metrics and retry policy |
 | **Backpressure** | bounded outboxes; a stalled peer gets a retryable refusal, never a frozen broker |
+| **Nothing wasted on the hot path** | one serialization per message (decode validates in place); the broker's encode never waits on its global mutex |
 | **A client that does the right thing** | `gaip-client`: failover driving a real socket, event cursor resuming across reconnects, CSIv2 on every call |
 
 **Security**: HMAC identity assertions with roles and delegation (CSIv2),
@@ -90,9 +91,9 @@ let (events, gap) = c.pull_events()?; // "what did I miss", cursor-aware
 
 ## Proven, not promised
 
-Every number below is produced by a script in this repo — CI re-runs them
-on every push, and the release workflow re-runs the whole gate before
-packaging any binary.
+Every number below is produced by a script in this repo — CI re-runs
+001–006 on every push and the release workflow re-runs the same gate
+before packaging any binary (007, the checkpoint cycle, runs on demand).
 
 | Check | Result |
 |---|---|
@@ -104,7 +105,6 @@ packaging any binary.
 | TLS 1.3 end-to-end | 4/4 |
 | Robustness set (failover, locks, events, stats) | 12/12 |
 | Checkpoint cycle (restart + replay) | 3/3 |
-| `conformance/vectors.json` | 37 byte-level vectors |
 
 ## Repository
 
@@ -118,9 +118,9 @@ gaip-broker/    the relay: URN routing, federation, dedupe, checkpoint,
                 failover registry, dead letters
 gaip-client/    the caller half: failover, cursor, interceptors
 gaip-bindings/  NATS, gRPC
-conformance/    byte-level vectors (normative)
+schema/         the contract on disk: envelope JSON-Schema +
+                intents IDL
 experiments/    7 end-to-end proofs
-SPEC.md         the normative document
 ```
 
 ## Honest scope
@@ -139,7 +139,10 @@ SPEC.md         the normative document
 
 | Version | What landed |
 |---|---|
-| **v0.5.0** | delivery stamps + dead letters, stream credits, signed schema push, deadline at the edge + negative cache, `gaip-client`, broker checkpoint |
+| **v0.5.1** | performance: decode validates in place (one serialization
+  per message), IDL validation without cloning the payload, the broker
+  encodes outside its global mutex |
+| v0.5.0 | delivery stamps + dead letters, stream credits, signed schema push, deadline at the edge + negative cache, `gaip-client`, broker checkpoint |
 | v0.4.0 | interceptors, transparent failover, `corbaname:`, locks with leases, event channel with QoS |
 | v0.3.0 | federated broker, schema push, trader query language, NATS + gRPC + TLS bindings, backpressure |
 | v0.2.0 | GIOP wire layer, service contexts, exceptions, IOR/naming/trader, IDL+IR, CSIv2 assertion |
