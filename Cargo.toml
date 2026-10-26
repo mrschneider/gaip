@@ -3,7 +3,7 @@ members = ["gaip-core", "gaip-engine", "gaip-broker", "gaip-bindings", "gaip-cli
 resolver = "2"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Guilherme <guilherme.barcha@gmail.com>"]
@@ -18,3 +18,10 @@ sha2 = "0.11"
 rustls = "0.23"
 signal-hook = "0.4"
 rustls-pemfile = "2"
+
+# Release binaries ship from CI on every tag: thin LTO crosses the
+# crate boundary (core -> engine/broker/client) without the full-link cost,
+# and codegen-units=1 keeps the inliner working across the hot wire path.
+[profile.release]
+lto = "thin"
+codegen-units = 1

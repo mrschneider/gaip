@@ -266,6 +266,7 @@ fn main() {
 /// connection must not be registered as a participant.
 fn serve_peer(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
     let mut chunk = [0u8; 16384];
     loop {
         match stream.read(&mut chunk) {
@@ -274,16 +275,26 @@ fn serve_peer(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream
             Err(_) => break,
         }
         loop {
-            match decode_wire(&buf) {
+            match decode_wire(&buf[pos..]) {
                 Ok(Some((msg, used))) => {
-                    buf.drain(..used);
+                    pos += used;
+                    if pos == buf.len() {
+                        buf.clear();
+                        pos = 0;
+                    }
                     handle(&shared, &conn, msg);
                 }
                 Ok(None) => break,
                 Err(_) => {
                     buf.clear();
+                    pos = 0;
                     break;
                 }
+            }
+            // one compaction per read, not one memmove per message
+            if pos > 0 {
+                buf.drain(..pos);
+                pos = 0;
             }
         }
     }
@@ -292,6 +303,7 @@ fn serve_peer(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream
 
 fn serve(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
     let mut chunk = [0u8; 16384];
     loop {
         match stream.read(&mut chunk) {
@@ -300,9 +312,13 @@ fn serve(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
             Err(_) => break,
         }
         loop {
-            match decode_wire(&buf) {
+            match decode_wire(&buf[pos..]) {
                 Ok(Some((msg, used))) => {
-                    buf.drain(..used);
+                    pos += used;
+                    if pos == buf.len() {
+                        buf.clear();
+                        pos = 0;
+                    }
                     if !handle(&shared, &conn, msg) {
                         return;
                     }
@@ -314,8 +330,14 @@ fn serve(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
                     };
                     let _ = encode_wire(&reply).map(|b| conn.out.send(b));
                     buf.clear();
+                    pos = 0;
                     break;
                 }
+            }
+            // one compaction per read, not one memmove per message
+            if pos > 0 {
+                buf.drain(..pos);
+                pos = 0;
             }
         }
     }
@@ -367,6 +389,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     contexts: reply_contexts,
                 }
             };
+            let reply = Arc::new(reply);
             // state under the lock, serialization outside it: the encode
             // of the reply must not sit in the queue of the global mutex
             let mut target_conn = None;
@@ -504,6 +527,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                         body: None,
                         contexts: Vec::new(),
                     };
+                    let reply = Arc::new(reply);
                     let mut b = shared.lock().unwrap();
                     b.dedupe
                         .remember(&body.sender, &body.message_id, reply.clone());
@@ -608,6 +632,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     body: None,
                     contexts: Vec::new(),
                 };
+                let reply = Arc::new(reply);
                 b.dedupe
                     .remember(&body.sender, &body.message_id, reply.clone());
                 drop(b);
@@ -664,7 +689,7 @@ impl Broker {
             .into_iter()
             .map(|(sender, msg_id, left_ms, reply)| {
                 json!({"sender": sender, "message_id": msg_id, "left_ms": left_ms,
-                       "reply": serde_json::to_string(&reply).unwrap_or_default()})
+                       "reply": serde_json::to_string(reply.as_ref()).unwrap_or_default()})
             })
             .collect();
         let doc = json!({"version": 1, "dedupe": rows, "failovers": self.failovers});

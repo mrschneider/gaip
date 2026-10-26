@@ -10,9 +10,9 @@
 //! ```
 //!
 //! SSE's own framing rules matter here: a `data:` line cannot contain a
-//! raw newline (that would end the event), so a pretty-printed envelope
-//! is emitted as several `data:` lines, which the client rejoins with
-//! `\n` — exactly the rule in the WHATWG spec.
+//! raw newline (that would end the event). The envelope travels as
+//! compact JSON — one `data:` line — and the decoder rejoins multiple
+//! lines with `\n`, so pretty emitters stay compatible (WHATWG rule).
 
 use crate::envelope::Envelope;
 use crate::error::GaipError;
@@ -20,7 +20,7 @@ use crate::error::GaipError;
 /// Render one envelope as one SSE event, ready to write to the response.
 pub fn encode_event(env: &Envelope) -> Result<String, GaipError> {
     env.validate()?;
-    let json = serde_json::to_string_pretty(env)?;
+    let json = serde_json::to_string(env)?;
     let mut out = String::new();
     out.push_str("event: ");
     out.push_str(env.message_type.as_str());
@@ -98,15 +98,32 @@ mod tests {
     }
 
     #[test]
-    fn event_carries_the_primitive_name_and_multiline_data() {
+    fn event_carries_the_primitive_name_and_compact_data() {
         let text = encode_event(&stream()).unwrap();
         assert!(text.starts_with("event: TASK_STREAM\n"), "{text}");
         assert!(text.ends_with("\n\n"), "SSE events end with a blank line");
-        assert!(
-            text.lines().filter(|l| l.starts_with("data: ")).count() > 1,
-            "pretty JSON is split across data lines"
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("data: ")).count(),
+            1,
+            "compact JSON travels as a single data line"
         );
         assert!(!text.contains("\ndata: \n"), "no empty data line mid-event");
+    }
+
+    #[test]
+    fn multiline_data_still_rejoins_for_pretty_emitters() {
+        // compatibility contract of the decoder: several `data:` lines
+        // are rejoined with a newline, so a pretty-printed emitter still parses
+        let env = stream();
+        let pretty = serde_json::to_string_pretty(&env).unwrap();
+        let mut text = String::from("event: TASK_STREAM\n");
+        for line in pretty.lines() {
+            text.push_str("data: ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push('\n');
+        assert_eq!(decode_event(&text).unwrap().unwrap(), env);
     }
 
     #[test]

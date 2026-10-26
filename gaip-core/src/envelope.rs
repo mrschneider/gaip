@@ -201,34 +201,40 @@ impl Envelope {
     /// Parse + validate in one step. This is the only entrance a
     /// transport should use: unvalidated envelopes must not exist.
     pub fn from_json(json: &str) -> Result<Self, GaipError> {
-        let env = Self::from_value(&serde_json::from_str(json)?)?;
-        Ok(env)
+        Self::from_value_owned(serde_json::from_str(json)?)
     }
 
     /// Deserialize from a `Value` with a precise error for an unknown
     /// primitive (serde's own message would be a generic "unknown
     /// variant", which hides the word the peer actually sent).
     pub fn from_value(v: &Value) -> Result<Self, GaipError> {
-        let obj = v.as_object().ok_or_else(|| GaipError::BadField {
+        Self::from_value_owned(v.clone())
+    }
+
+    /// Owning variant: MOVES the payload (and the id strings) out of
+    /// the parsed tree instead of deep-cloning the payload subtree.
+    /// The hot paths (decode_frame, decode_json, SSE) already own the
+    /// tree — the clone they paid was pure waste, once per message.
+    pub fn from_value_owned(mut v: Value) -> Result<Self, GaipError> {
+        let obj = v.as_object_mut().ok_or_else(|| GaipError::BadField {
             field: "envelope",
             why: "must be a JSON object".to_string(),
         })?;
-        let need = |name: &'static str| -> Result<String, GaipError> {
-            obj.get(name)
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or(GaipError::MissingField(name))
+        let mut take = |name: &'static str| -> Result<String, GaipError> {
+            match obj.remove(name) {
+                Some(Value::String(s)) => Ok(s),
+                _ => Err(GaipError::MissingField(name)),
+            }
         };
-        let protocol_version = need("protocol_version")?;
-        let message_id = need("message_id")?;
-        let correlation_id = need("correlation_id")?;
-        let sender = need("sender")?;
-        let recipient = need("recipient")?;
-        let raw_type = need("message_type")?;
+        let protocol_version = take("protocol_version")?;
+        let message_id = take("message_id")?;
+        let correlation_id = take("correlation_id")?;
+        let sender = take("sender")?;
+        let recipient = take("recipient")?;
+        let raw_type = take("message_type")?;
         let message_type = MessageType::parse(&raw_type)?;
         let payload = obj
-            .get("payload")
-            .cloned()
+            .remove("payload")
             .ok_or(GaipError::MissingField("payload"))?;
 
         let env = Self {

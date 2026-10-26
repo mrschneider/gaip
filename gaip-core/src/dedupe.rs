@@ -12,12 +12,13 @@
 
 use crate::message::{ReplyStatus, WireMessage};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// One remembered exchange.
 #[derive(Debug, Clone)]
 pub struct Remembered {
-    pub reply: WireMessage,
+    pub reply: Arc<WireMessage>,
     pub stored_at: Instant,
 }
 
@@ -54,7 +55,7 @@ impl DedupeCache {
         match self.entries.get(&key) {
             Some(r) if now.duration_since(r.stored_at) <= self.ttl => {
                 self.hits += 1;
-                Some(r.reply.clone())
+                Some(r.reply.as_ref().clone())
             }
             Some(_) => {
                 self.entries.remove(&key);
@@ -67,7 +68,8 @@ impl DedupeCache {
     /// Remember the reply for a completed request. Evicts the oldest
     /// entry when the window is full: the guarantee is bounded by the
     /// window, and pretending otherwise would be a lie.
-    pub fn remember(&mut self, sender: &str, message_id: &str, reply: WireMessage) {
+    pub fn remember(&mut self, sender: &str, message_id: &str, reply: impl Into<Arc<WireMessage>>) {
+        let reply = reply.into();
         let key = Self::key(sender, message_id);
         if self.entries.len() >= self.capacity {
             if let Some(oldest) = self.order.pop_front() {
@@ -112,7 +114,7 @@ impl DedupeCache {
     /// Snapshot for a checkpoint. `now` anchors the TTLs: each entry is
     /// stored with the milliseconds it still has to live, so a restore
     /// keeps the window honest instead of resetting it.
-    pub fn snapshot(&self, now: Instant) -> Vec<(String, String, u128, WireMessage)> {
+    pub fn snapshot(&self, now: Instant) -> Vec<(String, String, u128, Arc<WireMessage>)> {
         self.entries
             .iter()
             .filter_map(|((sender, msg_id), r)| {
@@ -127,7 +129,11 @@ impl DedupeCache {
     }
 
     /// Restore a checkpoint taken by [`Self::snapshot`].
-    pub fn restore(&mut self, now: Instant, rows: Vec<(String, String, u128, WireMessage)>) {
+    pub fn restore<T: Into<Arc<WireMessage>>>(
+        &mut self,
+        now: Instant,
+        rows: Vec<(String, String, u128, T)>,
+    ) {
         for (sender, msg_id, left_ms, reply) in rows {
             if self.entries.len() >= self.capacity {
                 break;
@@ -136,7 +142,7 @@ impl DedupeCache {
             self.entries.insert(
                 key.clone(),
                 Remembered {
-                    reply,
+                    reply: reply.into(),
                     stored_at: now
                         .checked_sub(Duration::from_millis(
                             (self.ttl.as_millis().saturating_sub(left_ms)) as u64,

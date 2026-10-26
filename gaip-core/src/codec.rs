@@ -54,7 +54,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Envelope, usize)>, GaipError> 
         return Ok(None);
     }
     let body = &buf[4..4 + len];
-    let env = Envelope::from_value(&serde_json::from_slice(body)?)?;
+    let env = Envelope::from_value_owned(serde_json::from_slice(body)?)?;
     Ok(Some((env, 4 + len)))
 }
 

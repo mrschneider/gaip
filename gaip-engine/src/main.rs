@@ -352,6 +352,7 @@ fn main() {
 
 fn serve(peer: Arc<Peer>, io: Io) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
     let mut chunk = [0u8; 16384];
     loop {
         // hold the lock only for the read, then release it so the Outbox
@@ -376,9 +377,13 @@ fn serve(peer: Arc<Peer>, io: Io) {
             Err(_) => return,
         }
         loop {
-            match decode_wire(&buf) {
+            match decode_wire(&buf[pos..]) {
                 Ok(Some((msg, used))) => {
-                    buf.drain(..used);
+                    pos += used;
+                    if pos == buf.len() {
+                        buf.clear();
+                        pos = 0;
+                    }
                     if !dispatch(&peer, msg) {
                         return;
                     }
@@ -392,8 +397,14 @@ fn serve(peer: Arc<Peer>, io: Io) {
                         reason: e.to_string(),
                     });
                     buf.clear();
+                    pos = 0;
                     break;
                 }
+            }
+            // one compaction per read, not one memmove per message
+            if pos > 0 {
+                buf.drain(..pos);
+                pos = 0;
             }
         }
     }
