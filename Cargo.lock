@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-bindings"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "gaip-core",
  "prost",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-broker"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "gaip-core",
  "serde_json",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-client"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "crypto-common",
  "digest",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "digest",
  "hmac",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-engine"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "gaip-core",
  "rustls",
