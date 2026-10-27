@@ -15,6 +15,7 @@
 
 use crate::error::GaipError;
 use crate::ior::Ior;
+use crate::urn::AgentUrn;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,14 +45,25 @@ impl AttrValue {
 pub struct Offer {
     pub ior: Ior,
     pub attributes: BTreeMap<String, AttrValue>,
+    /// The IOR's URN parsed once at construction. The URN never changes
+    /// after registration, so every query re-parsing it was O(N·k) string
+    /// splits for a value that cannot move. `None` only when the URN does
+    /// not parse — such an offer matches nothing, as before.
+    parsed_urn: Option<AgentUrn>,
 }
 
 impl Offer {
     pub fn new(ior: Ior) -> Self {
         Self {
+            parsed_urn: ior.urn.parse::<AgentUrn>().ok(),
             ior,
             attributes: BTreeMap::new(),
         }
+    }
+
+    /// The parsed URN, when it is a valid agent URN.
+    pub fn urn(&self) -> Option<&AgentUrn> {
+        self.parsed_urn.as_ref()
     }
 
     pub fn with_attr(mut self, key: &str, value: AttrValue) -> Self {
@@ -123,9 +135,11 @@ impl Query {
                 return false;
             }
         }
-        let urn = match offer.ior.urn.parse::<crate::urn::AgentUrn>() {
-            Ok(u) => u,
-            Err(_) => return false,
+        // Parsed once at registration; re-parsing per offer was the
+        // dominant cost of a query.
+        let urn = match offer.urn() {
+            Some(u) => u,
+            None => return false,
         };
         if let Some(cap) = &self.capability {
             if !offer.ior.has_capability(cap) {
@@ -391,11 +405,13 @@ impl Expr {
     fn resolve(&self, attr: &str, offer: &Offer) -> Option<AttrValue> {
         match attr {
             "runtime" | "framework" | "name" | "urn" => {
-                let urn = offer.ior.urn.parse::<crate::urn::AgentUrn>().ok()?;
+                // The cached parse from registration, not a fresh one —
+                // every resolved attribute used to re-split the URN.
+                let urn = offer.urn()?;
                 Some(AttrValue::Text(match attr {
-                    "runtime" => urn.runtime,
-                    "framework" => urn.framework,
-                    "name" => urn.name,
+                    "runtime" => urn.runtime.clone(),
+                    "framework" => urn.framework.clone(),
+                    "name" => urn.name.clone(),
                     _ => offer.ior.urn.clone(),
                 }))
             }
@@ -505,7 +521,17 @@ impl Trader {
     }
 
     pub fn best(&self, q: &Query) -> Option<&Offer> {
-        self.query(q).into_iter().next()
+        // Only the top hit is wanted: a full sort is O(n log n) for an
+        // answer one `max_by` finds in O(n). `max_by` takes an ASCENDING
+        // comparator — reusing the sort's descending one would return the
+        // minimum — so this is the same ordering flipped. Same choice as
+        // `query()[0]`, ties broken by URN either way.
+        self.offers.iter().filter(|o| q.matches(o)).max_by(|a, b| {
+            a.number("vram_free_mb")
+                .unwrap_or(0)
+                .cmp(&b.number("vram_free_mb").unwrap_or(0))
+                .then(b.ior.urn.cmp(&a.ior.urn))
+        })
     }
 
     pub fn len(&self) -> usize {

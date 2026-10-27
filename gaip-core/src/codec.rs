@@ -20,14 +20,7 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// Encode one envelope as a length-prefixed frame.
 pub fn encode_frame(env: &Envelope) -> Result<Vec<u8>, GaipError> {
     env.validate()?;
-    let body = serde_json::to_vec(env)?;
-    if body.len() > MAX_FRAME {
-        return Err(GaipError::FrameTooLarge(body.len()));
-    }
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(&body);
-    Ok(out)
+    encode_body(serde_json::to_vec(env)?)
 }
 
 /// Try to decode one frame from the front of `buf`.

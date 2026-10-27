@@ -25,8 +25,14 @@ pub struct Remembered {
 /// A bounded, TTL'd cache of completed requests.
 #[derive(Debug)]
 pub struct DedupeCache {
-    entries: BTreeMap<(String, String), Remembered>,
-    order: VecDeque<(String, String)>,
+    /// Key is `sender \u{1} message_id` in one String: the two halves are
+    /// URN/restricted text that cannot contain the separator, and one
+    /// flat key means one allocation per lookup instead of three (the
+    /// tuple plus its two fields) and a single-byte comparison scan.
+    /// BTreeMap stays — `order` is the FIFO eviction window and the
+    /// checkpoint replay depends on deterministic ordering.
+    entries: BTreeMap<String, Remembered>,
+    order: VecDeque<String>,
     capacity: usize,
     ttl: Duration,
     hits: u64,
@@ -43,8 +49,19 @@ impl DedupeCache {
         }
     }
 
-    fn key(sender: &str, message_id: &str) -> (String, String) {
-        (sender.to_string(), message_id.to_string())
+    const SEP: char = '\u{1}';
+
+    fn key(sender: &str, message_id: &str) -> String {
+        let mut k = String::with_capacity(sender.len() + message_id.len() + 1);
+        k.push_str(sender);
+        k.push(Self::SEP);
+        k.push_str(message_id);
+        k
+    }
+
+    /// The `(sender, message_id)` half-pair back out of a flat key.
+    fn split_key(k: &str) -> (&str, &str) {
+        k.split_once(Self::SEP).unwrap_or((k, ""))
     }
 
     /// Was this exact message already handled? Returns the reply to
@@ -117,13 +134,19 @@ impl DedupeCache {
     pub fn snapshot(&self, now: Instant) -> Vec<(String, String, u128, Arc<WireMessage>)> {
         self.entries
             .iter()
-            .filter_map(|((sender, msg_id), r)| {
+            .filter_map(|(k, r)| {
                 let left = now.duration_since(r.stored_at);
                 let left_ms = self.ttl.as_millis().saturating_sub(left.as_millis());
                 if left_ms == 0 {
                     return None;
                 }
-                Some((sender.clone(), msg_id.clone(), left_ms, r.reply.clone()))
+                let (sender, msg_id) = Self::split_key(k);
+                Some((
+                    sender.to_string(),
+                    msg_id.to_string(),
+                    left_ms,
+                    r.reply.clone(),
+                ))
             })
             .collect()
     }
@@ -138,7 +161,7 @@ impl DedupeCache {
             if self.entries.len() >= self.capacity {
                 break;
             }
-            let key = (sender.clone(), msg_id.clone());
+            let key = Self::key(&sender, &msg_id);
             self.entries.insert(
                 key.clone(),
                 Remembered {
