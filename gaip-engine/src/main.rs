@@ -79,6 +79,10 @@ struct Peer {
     /// stream credits granted by THIS connection's consumer: a
     /// TASK_STREAM costs one; a producer without credits waits
     credits: Arc<std::sync::atomic::AtomicI64>,
+    /// fixed task pool: one thread per task reserved 8 MiB of stack each
+    /// and exhausted the scheduler under task-heavy load; the pool bounds
+    /// both, process-wide
+    tasks: Arc<gaip_core::pool::Pool>,
 }
 
 impl Peer {
@@ -273,6 +277,19 @@ fn main() {
     // STATUS SURFACE: the recorder is process-wide (shared across peer
     // threads), and --stats-interval prints it — measurements, not guesses
     let shared_recorder = Arc::new(gaip_core::interceptor::Recorder::default());
+    // TASK POOL: GAIP_TASK_WORKERS overrides; otherwise cores x 4 —
+    // blocking task work tolerates over-subscription, thread-per-task
+    // does not scale past a few hundred tasks
+    let task_workers = std::env::var("GAIP_TASK_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get() * 4)
+                .unwrap_or(32)
+        });
+    let shared_tasks = Arc::new(gaip_core::pool::Pool::new(task_workers));
+    eprintln!("[engine] task pool: {task_workers} workers");
     let shared_locks = Arc::new(Mutex::new(gaip_core::locks::LockSet::new()));
     let shared_events = Arc::new(Mutex::new(gaip_core::events::EventChannel::new(
         gaip_core::events::Qos {
@@ -340,6 +357,7 @@ fn main() {
             locks: shared_locks.clone(),
             events: shared_events.clone(),
             credits: Arc::new(std::sync::atomic::AtomicI64::new(16)),
+            tasks: shared_tasks.clone(),
         });
         let n = i + 1;
         std::thread::spawn(move || {
@@ -846,7 +864,14 @@ fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContex
             let p = peer.clone();
             let e = env.clone();
             let c = ctx.clone();
-            std::thread::spawn(move || run_task(p, request_id, e, c));
+            let tasks = p.tasks.clone();
+            if !tasks.submit(move || run_task(p, request_id, e, c)) {
+                peer.reply(
+                    request_id,
+                    ReplyStatus::system(SystemMinor::Unavailable, "engine shutting down"),
+                    None,
+                );
+            }
         }
         MessageType::TaskReply => {
             // a human decision on a paused task
@@ -861,9 +886,10 @@ fn handle_request(peer: &Arc<Peer>, request_id: u32, contexts: Vec<ServiceContex
                            "horizon_days": 0, "artifacts_ref": [],
                            "resumed": true, "decision": decision}),
                 );
+                let tasks = peer.tasks.clone();
                 let p = peer.clone();
                 let c = ctx.clone();
-                std::thread::spawn(move || run_task(p, request_id, resume, c));
+                tasks.submit(move || run_task(p, request_id, resume, c));
             } else {
                 peer.reply(
                     request_id,

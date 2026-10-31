@@ -61,13 +61,25 @@ impl Outbox {
         let s = sent.clone();
         let b = bytes.clone();
         std::thread::spawn(move || {
-            while let Ok(chunk) = rx.recv() {
-                if writer.write_all(&chunk).is_err() {
-                    break; // the peer is gone; the outbox closes
+            'outer: while let Ok(first) = rx.recv() {
+                // BATCH DRAIN: everything already queued goes out under
+                // ONE flush. A flush per message defeats coalescing and
+                // turns every small frame into its own syscall round.
+                for chunk in [first] {
+                    if writer.write_all(&chunk).is_err() {
+                        break 'outer; // the peer is gone; the outbox closes
+                    }
+                    s.fetch_add(1, Ordering::Relaxed);
+                    b.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+                while let Ok(next) = rx.try_recv() {
+                    if writer.write_all(&next).is_err() {
+                        break 'outer; // the peer is gone; the outbox closes
+                    }
+                    s.fetch_add(1, Ordering::Relaxed);
+                    b.fetch_add(next.len() as u64, Ordering::Relaxed);
                 }
                 let _ = writer.flush();
-                s.fetch_add(1, Ordering::Relaxed);
-                b.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
         });
         Self {

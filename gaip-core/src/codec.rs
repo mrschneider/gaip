@@ -17,10 +17,32 @@ use crate::message::{ReplyStatus, SystemMinor, WireMessage};
 /// travel by reference (`artifacts_ref`), not inline.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
+/// Serialize `value` straight into a fresh buffer that already carries a
+/// 4-byte big-endian length prefix — ONE pass, no intermediate `to_vec`
+/// and no second copy. The length is patched after serialization fills
+/// the body.
+///
+/// `reserve` is a capacity hint (an underestimate is only a reallocation,
+/// never a correctness issue).
+fn serialize_framed<T: serde::Serialize>(
+    value: &T,
+    reserve: usize,
+) -> Result<Vec<u8>, GaipError> {
+    let mut out = Vec::with_capacity(4 + reserve);
+    out.extend_from_slice(&0u32.to_be_bytes()); // patched below
+    serde_json::to_writer(&mut out, value)?;
+    let len = out.len() - 4;
+    if len > MAX_FRAME {
+        return Err(GaipError::FrameTooLarge(len));
+    }
+    out[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    Ok(out)
+}
+
 /// Encode one envelope as a length-prefixed frame.
 pub fn encode_frame(env: &Envelope) -> Result<Vec<u8>, GaipError> {
     env.validate()?;
-    encode_body(serde_json::to_vec(env)?)
+    serialize_framed(env, 512)
 }
 
 /// Try to decode one frame from the front of `buf`.
@@ -51,9 +73,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Envelope, usize)>, GaipError> 
     Ok(Some((env, 4 + len)))
 }
 
-/// Encode a wire message as a length-prefixed frame.
+/// Encode a wire message as a length-prefixed frame. One pass: the JSON
+/// is written directly into the framed buffer instead of an intermediate
+/// `to_vec` that `encode_body` would copy again.
 pub fn encode_wire(msg: &WireMessage) -> Result<Vec<u8>, GaipError> {
-    encode_body(serde_json::to_vec(msg)?)
+    serialize_framed(msg, 512)
 }
 
 /// Wrap an already-serialized body in a frame. Callers that measured the

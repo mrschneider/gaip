@@ -97,6 +97,35 @@ impl Broker {
     }
 }
 
+/// Resolve the connections a request to `target` should go out on, and
+/// record the pending bookkeeping for the exactly-once replay. Local
+/// delivery first; a target that is not local floods every peer broker
+/// (the first good reply wins). Called while the shared mutex is held.
+fn resolve_targets(
+    b: &mut Broker,
+    target: &str,
+    request_id: u32,
+    body: &gaip_core::envelope::Envelope,
+) -> Vec<Arc<Conn>> {
+    let mut used: Vec<Arc<Conn>> = Vec::new();
+    let mut flooded_here = false;
+    if let Some(c) = b.conn_for(target) {
+        used.push(c);
+    } else {
+        used = b.peer_conns();
+        flooded_here = !used.is_empty();
+    }
+    if !used.is_empty() {
+        for c in &used {
+            b.pending.insert(
+                (c.id, request_id),
+                (body.sender.clone(), body.message_id.clone(), !flooded_here),
+            );
+        }
+    }
+    used
+}
+
 fn main() {
     let mut host = "0.0.0.0".to_string();
     let mut port = 7620u16;
@@ -361,43 +390,38 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
         } => {
             // DELIVERED: this broker handed the request to a LOCAL
             // participant — stamp the reply so the origin knows delivery
-            // was acknowledged, not assumed
-            let delivered_here = {
-                let b = shared.lock().unwrap();
-                b.pending
+            // was acknowledged, not assumed. Resolved inside the single
+            // critical section below.
+            // state under the lock, serialization outside it: the encode
+            // of the reply must not sit in the queue of the global mutex.
+            // ONE critical section: delivered-stamp, dedupe remember and
+            // recipient resolution were three separate lock acquisitions.
+            let mut target_conn = None;
+            let reply = {
+                let mut b = shared.lock().unwrap();
+                let delivered_here = b
+                    .pending
                     .get(&(conn.id, request_id))
-                    .map(|(_, _, local)| *local)
-            };
-            let reply = if delivered_here == Some(true) {
-                let own = shared.lock().unwrap().urn.clone();
-                let mut stamped = vec![gaip_core::ServiceContext::new(
-                    gaip_core::context::id::DELIVERED,
-                    own,
-                )];
-                stamped.extend(reply_contexts);
-                WireMessage::Reply {
+                    .map(|(_, _, local)| *local);
+                let mut stamped = reply_contexts;
+                if delivered_here == Some(true) {
+                    stamped.insert(
+                        0,
+                        gaip_core::ServiceContext::new(
+                            gaip_core::context::id::DELIVERED,
+                            b.urn.clone(),
+                        ),
+                    );
+                }
+                let reply = Arc::new(WireMessage::Reply {
                     request_id,
                     status,
                     body: body.clone(),
                     contexts: stamped,
-                }
-            } else {
-                WireMessage::Reply {
-                    request_id,
-                    status,
-                    body: body.clone(),
-                    contexts: reply_contexts,
-                }
-            };
-            let reply = Arc::new(reply);
-            // state under the lock, serialization outside it: the encode
-            // of the reply must not sit in the queue of the global mutex
-            let mut target_conn = None;
-            {
+                });
                 // exactly-once: remember the reply against the request
                 // that caused it, using the (connection, request_id) the
                 // broker handed out
-                let mut b = shared.lock().unwrap();
                 if let Some((sender, msg_id, _)) = b.pending.remove(&(conn.id, request_id)) {
                     b.dedupe.remember(&sender, &msg_id, reply.clone());
                 }
@@ -407,7 +431,8 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     let target = env.recipient.clone();
                     target_conn = b.conn_for(&target);
                 }
-            }
+                reply
+            };
             if let Some(c) = target_conn {
                 let _ = Broker::send_to(&c, &reply);
             }
@@ -474,169 +499,194 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                 }
                 eprintln!("[broker] {} registered", body.sender);
             }
-            let own = shared.lock().unwrap().urn.clone();
-            if ctx.route().contains(&own.as_str()) {
-                let reply = WireMessage::Reply {
-                    request_id,
-                    status: ReplyStatus::system(
-                        SystemMinor::ProtocolError,
-                        format!("routing loop: {own} is already in the route"),
-                    ),
-                    body: None,
-                    contexts: Vec::new(),
-                };
-                let _ = Broker::send_to(conn, &reply);
-                return true;
-            }
-            ctx.push_route(&own);
             let target = body.recipient.clone();
 
-            // exactly-once effect: replay the reply of a completed exchange
-            let cached = {
-                let mut b = shared.lock().unwrap();
-                b.dedupe.lookup(&body.sender, &body.message_id)
-            };
-            if let Some(WireMessage::Reply { status, body, .. }) = cached {
-                let reply = WireMessage::Reply {
-                    request_id,
-                    status,
-                    body,
-                    contexts: Vec::new(),
-                };
-                let _ = Broker::send_to(conn, &reply);
-                return true;
+            // ONE critical section for the whole decision: route check,
+            // exactly-once lookup, deadline, negative cache and the first
+            // resolution used to take FIVE separate lock acquisitions per
+            // request. Everything that needs shared state happens here;
+            // every serialization and enqueue happens after the lock is
+            // released.
+            enum Decision {
+                Loop(WireMessage),
+                Replay(WireMessage),
+                Expired(WireMessage),
+                Refusal(WireMessage),
+                Forward {
+                    conns: Vec<Arc<Conn>>,
+                    retries: u32,
+                    backoff: u64,
+                },
             }
-
-            let fwd = WireMessage::Request {
-                request_id,
-                contexts: ctx.to_vec(),
-                body: body.clone(),
-            };
-
-            // DEADLINE AT THE EDGE: an expired absolute deadline refuses
-            // right here — the broker does not spend a flood on work that
-            // cannot start
-            if let Some(deadline) = ctx.deadline_unix_ms() {
-                if deadline <= gaip_core::context::now_ms() {
-                    let reply = WireMessage::Reply {
+            let decision = {
+                let mut b = shared.lock().unwrap();
+                let own = b.urn.clone();
+                if ctx.route().contains(&own.as_str()) {
+                    Decision::Loop(WireMessage::Reply {
                         request_id,
                         status: ReplyStatus::system(
-                            SystemMinor::Timeout,
-                            "deadline expired at the broker".to_string(),
+                            SystemMinor::ProtocolError,
+                            format!("routing loop: {own} is already in the route"),
                         ),
                         body: None,
                         contexts: Vec::new(),
-                    };
-                    let reply = Arc::new(reply);
-                    let mut b = shared.lock().unwrap();
-                    b.dedupe
-                        .remember(&body.sender, &body.message_id, reply.clone());
-                    drop(b);
+                    })
+                } else {
+                    ctx.push_route(&own);
+                    // exactly-once effect: replay the reply of a completed exchange
+                    if let Some(WireMessage::Reply { status, body, .. }) =
+                        b.dedupe.lookup(&body.sender, &body.message_id)
+                    {
+                        Decision::Replay(WireMessage::Reply {
+                            request_id,
+                            status,
+                            body,
+                            contexts: Vec::new(),
+                        })
+                    }
+                    // DEADLINE AT THE EDGE: an expired absolute deadline
+                    // refuses right here — the broker does not spend a
+                    // flood on work that cannot start
+                    else if let Some(deadline) = ctx.deadline_unix_ms() {
+                        if deadline <= gaip_core::context::now_ms() {
+                            let reply = Arc::new(WireMessage::Reply {
+                                request_id,
+                                status: ReplyStatus::system(
+                                    SystemMinor::Timeout,
+                                    "deadline expired at the broker".to_string(),
+                                ),
+                                body: None,
+                                contexts: Vec::new(),
+                            });
+                            b.dedupe
+                                .remember(&body.sender, &body.message_id, reply.clone());
+                            Decision::Expired(WireMessage::Reply {
+                                request_id,
+                                status: ReplyStatus::system(
+                                    SystemMinor::Timeout,
+                                    "deadline expired at the broker".to_string(),
+                                ),
+                                body: None,
+                                contexts: Vec::new(),
+                            })
+                        } else {
+                            Decision::Forward {
+                                conns: resolve_targets(&mut b, &target, request_id, &body),
+                                retries: b.retries,
+                                backoff: b.backoff_ms,
+                            }
+                        }
+                    }
+                    // NEGATIVE CACHE: a target whose last attempt died
+                    // within the window is refused locally instead of
+                    // re-flooding the mesh. The refusal is retryable and
+                    // the window is short — the participant that appears
+                    // later is found on the next attempt.
+                    else if b
+                        .dead_ends
+                        .get(&target)
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
+                    {
+                        let refusal = ReplyStatus::system(
+                            SystemMinor::ObjectNotExist,
+                            format!("{target} was recently unreachable; retry after the negative-cache window"),
+                        );
+                        b.dedupe
+                            .remember_failure(&body.sender, &body.message_id, refusal.clone());
+                        Decision::Refusal(WireMessage::Reply {
+                            request_id,
+                            status: refusal,
+                            body: None,
+                            contexts: Vec::new(),
+                        })
+                    } else {
+                        Decision::Forward {
+                            conns: resolve_targets(&mut b, &target, request_id, &body),
+                            retries: b.retries,
+                            backoff: b.backoff_ms,
+                        }
+                    }
+                }
+            };
+
+            match decision {
+                Decision::Loop(reply)
+                | Decision::Expired(reply)
+                | Decision::Refusal(reply) => {
                     let _ = Broker::send_to(conn, &reply);
                     return true;
                 }
-            }
-
-            // NEGATIVE CACHE: a target whose last attempt died within the
-            // window is refused locally instead of re-flooding the mesh.
-            // The refusal is retryable and the window is short — the
-            // participant that appears later is found on the next attempt.
-            let recently_dead = {
-                let b = shared.lock().unwrap();
-                b.dead_ends
-                    .get(&target)
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
-            };
-            if recently_dead {
-                let reply = WireMessage::Reply {
-                    request_id,
-                    status: ReplyStatus::system(
-                        SystemMinor::ObjectNotExist,
-                        format!("{target} was recently unreachable; retry after the negative-cache window"),
-                    ),
-                    body: None,
-                    contexts: Vec::new(),
-                };
-                let mut b = shared.lock().unwrap();
-                b.dedupe.remember_failure(&body.sender, &body.message_id, ReplyStatus::system(
-                    SystemMinor::ObjectNotExist,
-                    format!("{target} was recently unreachable; retry after the negative-cache window"),
-                ));
-                drop(b);
-                let _ = Broker::send_to(conn, &reply);
-                return true;
-            }
-
-            // local first, then peers, with retry: "not yet" ≠ "never"
-            let (retries, backoff) = {
-                let b = shared.lock().unwrap();
-                (b.retries, b.backoff_ms)
-            };
-            let mut delivered = false;
-            for attempt in 0..=retries {
-                let conns: Vec<Arc<Conn>> = {
-                    let mut b = shared.lock().unwrap();
-                    let mut used: Vec<Arc<Conn>> = Vec::new();
-                    let mut flooded_here = false;
-                    if let Some(c) = b.conn_for(&target) {
-                        used.push(c);
-                    } else {
-                        used = b.peer_conns();
-                        flooded_here = !used.is_empty();
+                Decision::Replay(reply) => {
+                    let _ = Broker::send_to(conn, &reply);
+                    return true;
+                }
+                Decision::Forward { conns, retries, backoff } => {
+                    let fwd = WireMessage::Request {
+                        request_id,
+                        contexts: ctx.to_vec(),
+                        body: body.clone(),
+                    };
+                    // local first, then peers, with retry: "not yet" ≠ "never".
+                    // The FIRST resolution came from the single critical
+                    // section above; a retry re-locks only when nothing was
+                    // found, because a participant may appear mid-backoff.
+                    let mut delivered = !conns.is_empty();
+                    for c in &conns {
+                        let _ = Broker::send_to(c, &fwd);
                     }
-                    if !used.is_empty() {
-                        for c in &used {
-                            b.pending.insert(
-                                (c.id, request_id),
-                                (body.sender.clone(), body.message_id.clone(), !flooded_here),
-                            );
+                    if !delivered {
+                        for attempt in 0..retries {
+                            std::thread::sleep(Duration::from_millis(
+                                backoff * (attempt as u64 + 1),
+                            ));
+                            let conns = {
+                                let mut b = shared.lock().unwrap();
+                                resolve_targets(&mut b, &target, request_id, &body)
+                            };
+                            // serialize + enqueue outside the lock: the
+                            // encode of the forwarded request is the
+                            // broker's hottest path
+                            for c in &conns {
+                                let _ = Broker::send_to(c, &fwd);
+                            }
+                            if !conns.is_empty() {
+                                delivered = true;
+                                break;
+                            }
                         }
                     }
-                    used
-                };
-                // serialize + enqueue outside the lock: the encode of the
-                // forwarded request is the broker's hottest path
-                for c in &conns {
-                    let _ = Broker::send_to(c, &fwd);
+                    if !delivered {
+                        // DEAD LETTER: recorded with the reason, not dropped silently
+                        let reply = {
+                            let mut b = shared.lock().unwrap();
+                            b.dead_ends
+                                .insert(target.clone(), std::time::Instant::now());
+                            b.dead_letters.push_back((
+                                gaip_core::context::now_ms(),
+                                body.sender.clone(),
+                                target.clone(),
+                                "no reachable broker or participant".to_string(),
+                            ));
+                            while b.dead_letters.len() > 256 {
+                                b.dead_letters.pop_front();
+                            }
+                            b.journal_dead_letter(&body.sender, &target);
+                            let reply = Arc::new(WireMessage::Reply {
+                                request_id,
+                                status: ReplyStatus::system(
+                                    SystemMinor::ObjectNotExist,
+                                    format!("{target} is not reachable through this broker or its peers"),
+                                ),
+                                body: None,
+                                contexts: Vec::new(),
+                            });
+                            b.dedupe
+                                .remember(&body.sender, &body.message_id, reply.clone());
+                            reply
+                        };
+                        let _ = Broker::send_to(conn, &reply);
+                    }
                 }
-                if !conns.is_empty() {
-                    delivered = true;
-                    break;
-                }
-                if attempt < retries {
-                    std::thread::sleep(Duration::from_millis(backoff * (attempt as u64 + 1)));
-                }
-            }
-
-            if !delivered {
-                // DEAD LETTER: recorded with the reason, not dropped silently
-                let mut b = shared.lock().unwrap();
-                b.dead_ends
-                    .insert(target.clone(), std::time::Instant::now());
-                b.dead_letters.push_back((
-                    gaip_core::context::now_ms(),
-                    body.sender.clone(),
-                    target.clone(),
-                    "no reachable broker or participant".to_string(),
-                ));
-                while b.dead_letters.len() > 256 {
-                    b.dead_letters.pop_front();
-                }
-                b.journal_dead_letter(&body.sender, &target);
-                let reply = WireMessage::Reply {
-                    request_id,
-                    status: ReplyStatus::system(
-                        SystemMinor::ObjectNotExist,
-                        format!("{target} is not reachable through this broker or its peers"),
-                    ),
-                    body: None,
-                    contexts: Vec::new(),
-                };
-                let reply = Arc::new(reply);
-                b.dedupe
-                    .remember(&body.sender, &body.message_id, reply.clone());
-                drop(b);
-                let _ = Broker::send_to(conn, &reply);
             }
             true
         }
