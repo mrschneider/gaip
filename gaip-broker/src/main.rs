@@ -610,9 +610,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             };
 
             match decision {
-                Decision::Loop(reply)
-                | Decision::Expired(reply)
-                | Decision::Refusal(reply) => {
+                Decision::Loop(reply) | Decision::Expired(reply) | Decision::Refusal(reply) => {
                     let _ = Broker::send_to(conn, &reply);
                     return true;
                 }
@@ -620,7 +618,11 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     let _ = Broker::send_to(conn, &reply);
                     return true;
                 }
-                Decision::Forward { conns, retries, backoff } => {
+                Decision::Forward {
+                    conns,
+                    retries,
+                    backoff,
+                } => {
                     let fwd = WireMessage::Request {
                         request_id,
                         contexts: ctx.to_vec(),

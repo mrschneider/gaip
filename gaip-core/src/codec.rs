@@ -24,10 +24,7 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 ///
 /// `reserve` is a capacity hint (an underestimate is only a reallocation,
 /// never a correctness issue).
-fn serialize_framed<T: serde::Serialize>(
-    value: &T,
-    reserve: usize,
-) -> Result<Vec<u8>, GaipError> {
+fn serialize_framed<T: serde::Serialize>(value: &T, reserve: usize) -> Result<Vec<u8>, GaipError> {
     let mut out = Vec::with_capacity(4 + reserve);
     out.extend_from_slice(&0u32.to_be_bytes()); // patched below
     serde_json::to_writer(&mut out, value)?;
