@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// One peer on the other side of a connection (participant or broker).
@@ -44,16 +44,30 @@ struct Conn {
     out: Arc<Outbox>,
 }
 
+/// (connection id, request id) of a forwarded request awaiting its reply.
+type PendingKey = (u64, u32);
+/// (sender, message_id) of the request that produced the pending reply.
+type PendingEntry = (String, String);
+/// Forwarded requests awaiting their reply, keyed by the connection the
+/// reply will arrive on.
+type PendingMap = BTreeMap<PendingKey, PendingEntry>;
+
 struct Broker {
     urn: String,
     /// participants (and peers) registered on this broker, by URN
     local: BTreeMap<String, Arc<Conn>>,
     /// peer brokers (their connections are entries in `local` too)
     peers: Vec<Arc<Conn>>,
-    dedupe: DedupeCache,
-    /// forwarded request -> (sender, message_id), so the reply that
-    /// comes back can be remembered for exactly-once replay
-    pending: BTreeMap<(u64, u32), (String, String, bool)>,
+    /// exactly-once window behind its own Mutex so the routing decision
+    /// (which runs under the broker's READ lock) never needs a write
+    /// acquisition on the broker itself.
+    dedupe: Mutex<DedupeCache>,
+    /// forwarded LOCAL request -> (sender, message_id): the reply that
+    /// comes back is remembered for exactly-once replay. Hot path.
+    pending_local: Mutex<PendingMap>,
+    /// forwarded FLOODED request -> (sender, message_id): the rare
+    /// non-local path, kept off `pending_local`'s lock.
+    pending_flood: Mutex<PendingMap>,
     /// targets whose last delivery attempt died: skip re-flooding for a
     /// short window (the participant may still appear, so the window is
     /// short and the refusal retryable)
@@ -100,26 +114,29 @@ impl Broker {
 /// Resolve the connections a request to `target` should go out on, and
 /// record the pending bookkeeping for the exactly-once replay. Local
 /// delivery first; a target that is not local floods every peer broker
-/// (the first good reply wins). Called while the shared mutex is held.
+/// (the first good reply wins). Called while the broker's READ lock is
+/// held: the routing maps are read-only here, and only the short inner
+/// pending Mutexes are written (never the global lock).
 fn resolve_targets(
-    b: &mut Broker,
+    b: &Broker,
     target: &str,
     request_id: u32,
     body: &gaip_core::envelope::Envelope,
 ) -> Vec<Arc<Conn>> {
-    let mut used: Vec<Arc<Conn>> = Vec::new();
-    let mut flooded_here = false;
     if let Some(c) = b.conn_for(target) {
-        used.push(c);
-    } else {
-        used = b.peer_conns();
-        flooded_here = !used.is_empty();
+        b.pending_local.lock().unwrap().insert(
+            (c.id, request_id),
+            (body.sender.clone(), body.message_id.clone()),
+        );
+        return vec![c];
     }
+    let used = b.peer_conns();
     if !used.is_empty() {
+        let mut pf = b.pending_flood.lock().unwrap();
         for c in &used {
-            b.pending.insert(
+            pf.insert(
                 (c.id, request_id),
-                (body.sender.clone(), body.message_id.clone(), !flooded_here),
+                (body.sender.clone(), body.message_id.clone()),
             );
         }
     }
@@ -180,12 +197,13 @@ fn main() {
     eprintln!("[broker] {urn} listening on {host}:{port}");
 
     let next_conn = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let broker = Arc::new(Mutex::new(Broker {
+    let broker = Arc::new(RwLock::new(Broker {
         urn,
         local: BTreeMap::new(),
         peers: Vec::new(),
-        dedupe: DedupeCache::new(4096, Duration::from_secs(120)),
-        pending: BTreeMap::new(),
+        dedupe: Mutex::new(DedupeCache::new(4096, Duration::from_secs(120))),
+        pending_local: Mutex::new(BTreeMap::new()),
+        pending_flood: Mutex::new(BTreeMap::new()),
         dead_ends: BTreeMap::new(),
         dead_letters: std::collections::VecDeque::new(),
         retries,
@@ -200,11 +218,11 @@ fn main() {
     // loading only --registry forgets every completed exchange and turns
     // exactly-once into at-least-once across the restart
     if let Some(path) = &state_path {
-        broker.lock().unwrap().load_registry(path);
+        broker.write().unwrap().load_registry(path);
         eprintln!("[broker] state loaded from {}", path.display());
     }
     if let Some(path) = &registry_path {
-        broker.lock().unwrap().load_registry(path);
+        broker.write().unwrap().load_registry(path);
         eprintln!("[broker] registry loaded from {}", path.display());
     }
     // GRACEFUL SHUTDOWN: SIGTERM/SIGINT set the drain flag and checkpoint
@@ -221,11 +239,11 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(100));
             }
             eprintln!("[broker] signal received: draining");
-            b.lock()
+            b.write()
                 .unwrap()
                 .draining
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            b.lock().unwrap().checkpoint();
+            b.read().unwrap().checkpoint();
             // the accept loop cannot be interrupted out of `incoming()`;
             // the checkpoint is written, so exiting here is the clean cut
             std::process::exit(0);
@@ -255,7 +273,7 @@ fn main() {
         }
         match connected {
             Some((conn, _s, reader)) => {
-                broker.lock().unwrap().peers.push(conn.clone());
+                broker.write().unwrap().peers.push(conn.clone());
                 // a peer's traffic (replies, locate answers) is handled
                 // exactly like any other connection
                 let b2 = broker.clone();
@@ -269,7 +287,7 @@ fn main() {
         .incoming()
         .take_while(|_| {
             !broker
-                .lock()
+                .read()
                 .unwrap()
                 .draining
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -293,7 +311,7 @@ fn main() {
 
 /// Read loop for a PEER broker: its messages are handled but the
 /// connection must not be registered as a participant.
-fn serve_peer(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
+fn serve_peer(shared: Arc<RwLock<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
     let mut buf: Vec<u8> = Vec::new();
     let mut pos = 0usize;
     let mut chunk = [0u8; 16384];
@@ -330,7 +348,7 @@ fn serve_peer(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream
     eprintln!("[broker] peer connection closed");
 }
 
-fn serve(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
+fn serve(shared: Arc<RwLock<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
     let mut buf: Vec<u8> = Vec::new();
     let mut pos = 0usize;
     let mut chunk = [0u8; 16384];
@@ -372,13 +390,12 @@ fn serve(shared: Arc<Mutex<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
     }
     let name = conn.urn.lock().unwrap().clone();
     if let Some(n) = name {
-        let mut b = shared.lock().unwrap();
-        b.local.remove(&n);
+        shared.write().unwrap().local.remove(&n);
         eprintln!("[broker] {n} disconnected");
     }
 }
 
-fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bool {
+fn handle(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bool {
     match msg {
         WireMessage::CloseConnection => false,
 
@@ -394,17 +411,24 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             // critical section below.
             // state under the lock, serialization outside it: the encode
             // of the reply must not sit in the queue of the global mutex.
-            // ONE critical section: delivered-stamp, dedupe remember and
-            // recipient resolution were three separate lock acquisitions.
+            // READ lock: recipient resolution and the local pending
+            // lookup are pure reads; only the short inner Mutexes are
+            // written. A FLOODED reply's remember is skipped — the
+            // origin's retry is the safety net there, and flooding was
+            // never on the hot path anyway.
             let mut target_conn = None;
             let reply = {
-                let mut b = shared.lock().unwrap();
-                let delivered_here = b
-                    .pending
-                    .get(&(conn.id, request_id))
-                    .map(|(_, _, local)| *local);
+                let b = shared.read().unwrap();
+                // LOCAL delivery first (the hot path), then the flood map:
+                // both entries are REMOVED here, so neither map can grow
+                // without bound, and a flooded reply is remembered exactly
+                // like a local one (the origin must replay what it relayed).
+                let key = (conn.id, request_id);
+                let local = b.pending_local.lock().unwrap().remove(&key);
+                let delivered_here = local.is_some();
+                let pending = local.or_else(|| b.pending_flood.lock().unwrap().remove(&key));
                 let mut stamped = reply_contexts;
-                if delivered_here == Some(true) {
+                if delivered_here {
                     stamped.insert(
                         0,
                         gaip_core::ServiceContext::new(
@@ -422,8 +446,11 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                 // exactly-once: remember the reply against the request
                 // that caused it, using the (connection, request_id) the
                 // broker handed out
-                if let Some((sender, msg_id, _)) = b.pending.remove(&(conn.id, request_id)) {
-                    b.dedupe.remember(&sender, &msg_id, reply.clone());
+                if let Some((sender, msg_id)) = pending {
+                    b.dedupe
+                        .lock()
+                        .unwrap()
+                        .remember(&sender, &msg_id, reply.clone());
                 }
                 // a reply travels to the envelope's recipient: no session
                 // state, no request-id bookkeeping
@@ -442,7 +469,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
         WireMessage::LocateReply { .. } => true,
 
         WireMessage::LocateRequest { request_id, target } => {
-            let b = shared.lock().unwrap();
+            let b = shared.read().unwrap();
             let known = b.urn == target || b.local.contains_key(&target);
             let reply = if known {
                 WireMessage::LocateReply {
@@ -480,7 +507,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             }
             let mut ctx = ContextList::from_vec(contexts);
             if registered_new {
-                let mut b = shared.lock().unwrap();
+                let mut b = shared.write().unwrap();
                 b.local.insert(body.sender.clone(), conn.clone());
                 // FAILOVER context: the participant advertises where else
                 // it can be reached; the reference outlives the socket
@@ -501,11 +528,12 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             }
             let target = body.recipient.clone();
 
-            // ONE critical section for the whole decision: route check,
-            // exactly-once lookup, deadline, negative cache and the first
-            // resolution used to take FIVE separate lock acquisitions per
-            // request. Everything that needs shared state happens here;
-            // every serialization and enqueue happens after the lock is
+            // ONE critical section for the whole decision, under the
+            // broker's READ lock: route check, exactly-once lookup,
+            // deadline, negative cache and the first resolution used to
+            // take FIVE separate lock acquisitions per request.
+            // Everything that needs shared state happens here; every
+            // serialization and enqueue happens after the lock is
             // released.
             enum Decision {
                 Loop(WireMessage),
@@ -519,7 +547,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                 },
             }
             let decision = {
-                let mut b = shared.lock().unwrap();
+                let b = shared.read().unwrap();
                 let own = b.urn.clone();
                 if ctx.route().contains(&own.as_str()) {
                     Decision::Loop(WireMessage::Reply {
@@ -533,10 +561,17 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     })
                 } else {
                     ctx.push_route(&own);
-                    // exactly-once effect: replay the reply of a completed exchange
-                    if let Some(WireMessage::Reply { status, body, .. }) =
-                        b.dedupe.lookup(&body.sender, &body.message_id)
-                    {
+                    // exactly-once effect: replay the reply of a completed
+                    // exchange. The probe runs FIRST, into a local, so the
+                    // MutexGuard is released before the else-chain: a guard
+                    // held across an `if let` scrutinee would deadlock the
+                    // `remember` calls below (std Mutex is not reentrant).
+                    let cached = b
+                        .dedupe
+                        .lock()
+                        .unwrap()
+                        .lookup_read(&body.sender, &body.message_id);
+                    if let Some(WireMessage::Reply { status, body, .. }) = cached {
                         Decision::Replay(WireMessage::Reply {
                             request_id,
                             status,
@@ -558,8 +593,11 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                                 body: None,
                                 contexts: Vec::new(),
                             });
-                            b.dedupe
-                                .remember(&body.sender, &body.message_id, reply.clone());
+                            b.dedupe.lock().unwrap().remember(
+                                &body.sender,
+                                &body.message_id,
+                                reply.clone(),
+                            );
                             Decision::Expired(WireMessage::Reply {
                                 request_id,
                                 status: ReplyStatus::system(
@@ -571,7 +609,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                             })
                         } else {
                             Decision::Forward {
-                                conns: resolve_targets(&mut b, &target, request_id, &body),
+                                conns: resolve_targets(&b, &target, request_id, &body),
                                 retries: b.retries,
                                 backoff: b.backoff_ms,
                             }
@@ -591,8 +629,11 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                             SystemMinor::ObjectNotExist,
                             format!("{target} was recently unreachable; retry after the negative-cache window"),
                         );
-                        b.dedupe
-                            .remember_failure(&body.sender, &body.message_id, refusal.clone());
+                        b.dedupe.lock().unwrap().remember_failure(
+                            &body.sender,
+                            &body.message_id,
+                            refusal.clone(),
+                        );
                         Decision::Refusal(WireMessage::Reply {
                             request_id,
                             status: refusal,
@@ -601,7 +642,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                         })
                     } else {
                         Decision::Forward {
-                            conns: resolve_targets(&mut b, &target, request_id, &body),
+                            conns: resolve_targets(&b, &target, request_id, &body),
                             retries: b.retries,
                             backoff: b.backoff_ms,
                         }
@@ -642,8 +683,8 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                                 backoff * (attempt as u64 + 1),
                             ));
                             let conns = {
-                                let mut b = shared.lock().unwrap();
-                                resolve_targets(&mut b, &target, request_id, &body)
+                                let b = shared.read().unwrap();
+                                resolve_targets(&b, &target, request_id, &body)
                             };
                             // serialize + enqueue outside the lock: the
                             // encode of the forwarded request is the
@@ -660,7 +701,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                     if !delivered {
                         // DEAD LETTER: recorded with the reason, not dropped silently
                         let reply = {
-                            let mut b = shared.lock().unwrap();
+                            let mut b = shared.write().unwrap();
                             b.dead_ends
                                 .insert(target.clone(), std::time::Instant::now());
                             b.dead_letters.push_back((
@@ -682,8 +723,11 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
                                 body: None,
                                 contexts: Vec::new(),
                             });
-                            b.dedupe
-                                .remember(&body.sender, &body.message_id, reply.clone());
+                            b.dedupe.lock().unwrap().remember(
+                                &body.sender,
+                                &body.message_id,
+                                reply.clone(),
+                            );
                             reply
                         };
                         let _ = Broker::send_to(conn, &reply);
@@ -704,7 +748,7 @@ fn handle(shared: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bo
             // fleet converges on one contract; the contexts (the signed
             // identity) travel with it
             let msg = WireMessage::SchemaSync { idl, contexts };
-            let local: Vec<Arc<Conn>> = shared.lock().unwrap().local.values().cloned().collect();
+            let local: Vec<Arc<Conn>> = shared.read().unwrap().local.values().cloned().collect();
             for c in local {
                 let _ = Broker::send_to(&c, &msg);
             }
@@ -737,6 +781,8 @@ impl Broker {
         let now = std::time::Instant::now();
         let rows: Vec<serde_json::Value> = self
             .dedupe
+            .lock()
+            .unwrap()
             .snapshot(now)
             .into_iter()
             .map(|(sender, msg_id, left_ms, reply)| {
@@ -783,7 +829,10 @@ impl Broker {
                         })
                         .collect();
                     let n = restored.len();
-                    self.dedupe.restore(std::time::Instant::now(), restored);
+                    self.dedupe
+                        .lock()
+                        .unwrap()
+                        .restore(std::time::Instant::now(), restored);
                     if n > 0 {
                         eprintln!(
                             "[broker] restored {n} completed exchanges from {}",

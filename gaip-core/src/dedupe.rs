@@ -82,6 +82,23 @@ impl DedupeCache {
         }
     }
 
+    /// Read-only probe: was this exact message already handled?
+    ///
+    /// `lookup` is `&mut` (it counts hits and evicts expired entries) and
+    /// therefore needs the broker's WRITE lock. The routing decision runs
+    /// under the READ lock — the hot path — so this side-effect-free
+    /// variant exists so the exactly-once check does not force a write
+    /// acquisition. Expired entries are simply reported as a miss; the
+    /// sweep path (or the next `lookup`) reclaims them.
+    pub fn lookup_read(&self, sender: &str, message_id: &str) -> Option<WireMessage> {
+        let key = Self::key(sender, message_id);
+        let now = Instant::now();
+        self.entries
+            .get(&key)
+            .filter(|r| now.duration_since(r.stored_at) <= self.ttl)
+            .map(|r| r.reply.as_ref().clone())
+    }
+
     /// Remember the reply for a completed request. Evicts the oldest
     /// entry when the window is full: the guarantee is bounded by the
     /// window, and pretending otherwise would be a lie.
