@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
 [![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
-[![Crates.io-style version](https://img.shields.io/badge/version-0.5.2-blue.svg)](releases)
+[![Crates.io-style version](https://img.shields.io/badge/version-0.5.4-blue.svg)](releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Python/LangGraph planner, a Java Spring service and a Rust execution
@@ -97,7 +97,7 @@ before packaging any binary (007, the checkpoint cycle, runs on demand).
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | 135 tests (unit + hostile input + client integration) |
+| `cargo test --workspace` | 138 tests (unit + hostile input + client integration) |
 | GIOP layer end-to-end | 28/28 |
 | Federated brokers end-to-end | 9/9 |
 | NATS (real nats-server) | PASS |
@@ -139,7 +139,15 @@ experiments/    7 end-to-end proofs
 
 | Version | What landed |
 |---|---|
-| **v0.5.2** | performance round 2: read loops consume by offset (one
+| **v0.5.4** | performance round 3: single-pass framed serialization
+  (`to_writer` straight into the length-prefixed buffer), outbox writer
+  flushing once per batch, fixed task pool (`GAIP_TASK_WORKERS`) replacing
+  thread-per-task, broker routing under a read lock with per-map inner
+  mutexes (dedupe, pending-local, pending-flood) and a side-effect-free
+  dedupe probe |
+| v0.5.3 | performance: cached parsed URN in `Offer`, partial `best()`
+  selection, flat dedupe key (one allocation per lookup) |
+| v0.5.2 | performance round 2: read loops consume by offset (one
   compaction per read), envelope parse moves the payload, dedupe replies
   shared by Arc (no clone under the broker lock), compact SSE events,
   release profile with thin LTO |
