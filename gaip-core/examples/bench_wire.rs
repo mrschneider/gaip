@@ -1,6 +1,10 @@
-//! Hot-path micro-benchmark: encode_wire, encode+decode, to_vec+encode_body.
+//! Hot-path micro-benchmark: encode_wire, encode+decode, to_vec+encode_body,
+//! and the relay's routing path (read the routing fields, re-frame with the
+//! body bytes untouched).
 //! Run with: cargo run --release -p gaip-core --example bench_wire [-- N]
-use gaip_core::codec::{decode_wire, encode_body, encode_wire};
+use gaip_core::codec::{
+    decode_wire, decode_wire_view, encode_body, encode_request_view, encode_wire, WireFrame,
+};
 use gaip_core::envelope::{Envelope, MessageType};
 use gaip_core::message::WireMessage;
 use std::time::Instant;
@@ -39,7 +43,7 @@ fn bench(name: &str, iters: u64, f: impl Fn()) {
     }
     let elapsed = start.elapsed();
     let ns = elapsed.as_nanos() as f64 / iters as f64;
-    println!("{name:>22}: {ns:10.2} ns/op  ({:.0} M/s)", 1e9 / ns / 1e6);
+    println!("{name:>26}: {ns:10.2} ns/op  ({:.0} M/s)", 1e9 / ns / 1e6);
 }
 
 fn main() {
@@ -58,6 +62,28 @@ fn main() {
     bench("encode+decode", iters, || {
         let b = encode_wire(&msg).unwrap();
         let _ = decode_wire(&b).unwrap();
+    });
+    bench("decode_wire (participant)", iters, || {
+        let _ = decode_wire(&bytes).unwrap();
+    });
+    bench("decode_wire_view (relay)", iters, || {
+        let _ = decode_wire_view(&bytes).unwrap();
+    });
+    // What a relay does per request: read the routing fields, then re-frame
+    // with one extra service context and the body bytes it arrived with.
+    bench("relay: full decode + encode", iters, || {
+        let (msg, _) = decode_wire(&bytes).unwrap().unwrap();
+        let _ = encode_wire(&msg);
+    });
+    bench("relay: view + reframe", iters, || {
+        let (frame, _) = decode_wire_view(&bytes).unwrap().unwrap();
+        if let WireFrame::Request(req) = frame {
+            let hop = gaip_core::ServiceContext::new(
+                gaip_core::context::id::ROUTE,
+                "urn:agent:gaip:broker:b1",
+            );
+            let _ = encode_request_view(req.request_id, &[hop], req.envelope);
+        }
     });
     let body = serde_json::to_vec(&msg).unwrap();
     bench("to_vec+encode_body", iters, || {

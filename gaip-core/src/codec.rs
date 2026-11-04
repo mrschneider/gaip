@@ -9,9 +9,13 @@
 //! Bindings that are already message-oriented (Kafka, NATS, SSE) skip
 //! the length prefix and carry the JSON as the message body.
 
-use crate::envelope::{check_version, Envelope};
+use crate::context::ServiceContext;
+use crate::envelope::{check_version, Envelope, MessageType};
 use crate::error::GaipError;
 use crate::message::{ReplyStatus, SystemMinor, WireMessage};
+use crate::urn::AgentUrn;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// 8 MiB. An agent payload above this is an artifact, and artifacts
 /// travel by reference (`artifacts_ref`), not inline.
@@ -115,6 +119,206 @@ pub fn decode_wire(buf: &[u8]) -> Result<Option<(WireMessage, usize)>, GaipError
     // validate the embedded envelope in place — no re-encode/re-parse
     msg.validate_envelopes()?;
     Ok(Some((msg, 4 + len)))
+}
+
+// ── routing view: relay a REQUEST without parsing its payload ──────────
+//
+// A relay decides on `wire`, `request_id`, `contexts`, and five envelope
+// fields (version, ids, addresses). It then forwards the message with the
+// ROUTE context appended — and today it pays for the whole thing twice:
+// the payload is parsed into a `Value` tree and then re-serialized on the
+// way out. On this wire that is most of what a relayed message costs.
+//
+// [`decode_wire_view`] keeps the envelope's `payload` as [`RawValue`]: the
+// bytes are validated (shape, not content) and carried through verbatim,
+// so the relay never builds the tree. [`encode_request_view`] splices
+// those exact bytes back into a new frame.
+
+/// The routing half of a `REQUEST`: the fields a relay reads, with the
+/// envelope body still in wire form.
+#[derive(Debug)]
+pub struct RoutedRequest<'a> {
+    pub request_id: u32,
+    pub contexts: Vec<ServiceContext>,
+    /// The whole envelope object, byte-for-byte as it arrived: the relay
+    /// forwards these bytes, it never rebuilds the envelope.
+    pub envelope: &'a RawValue,
+    /// Validated envelope fields: the relay routes on them, the forward
+    /// does not need to look at them again.
+    pub sender: String,
+    pub recipient: String,
+    pub message_id: String,
+}
+
+/// A decoded frame: a `REQUEST` a relay can forward without parsing the
+/// payload, or anything else (already a full [`WireMessage`]).
+#[derive(Debug)]
+pub enum WireFrame<'a> {
+    Request(RoutedRequest<'a>),
+    Other(WireMessage),
+}
+
+/// The borrowed envelope: the same fields as [`Envelope`], plus a raw
+/// payload.
+///
+/// `validate` runs before the caller sees it, so a frame accepted here is
+/// exactly the frame [`decode_wire`] would have accepted — the difference
+/// is that the payload was checked for shape and never turned into a tree.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "'de: 'a"))]
+struct RoutedEnvelope<'a> {
+    protocol_version: String,
+    message_id: String,
+    correlation_id: String,
+    sender: String,
+    recipient: String,
+    /// Parsed so an unknown primitive is refused here, with the word the
+    /// peer sent — the relay never routes on it, which is why it is `_`.
+    #[serde(rename = "message_type")]
+    _message_type: MessageType,
+    #[serde(borrow)]
+    payload: &'a RawValue,
+}
+
+impl RoutedEnvelope<'_> {
+    /// The checks [`Envelope::validate`] performs, on borrowed fields.
+    fn validate(&self) -> Result<(), GaipError> {
+        check_version(&self.protocol_version)?;
+        for (field, value) in [
+            ("message_id", &self.message_id),
+            ("correlation_id", &self.correlation_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(GaipError::BadField {
+                    field,
+                    why: "must not be empty".to_string(),
+                });
+            }
+            if value.len() > 128 {
+                return Err(GaipError::BadField {
+                    field,
+                    why: "must be at most 128 characters".to_string(),
+                });
+            }
+        }
+        for (field, value) in [("sender", &self.sender), ("recipient", &self.recipient)] {
+            if let Err(e) = value.parse::<AgentUrn>() {
+                return Err(GaipError::BadField {
+                    field,
+                    why: e.to_string(),
+                });
+            }
+        }
+        if self.sender == self.recipient {
+            return Err(GaipError::BadField {
+                field: "recipient",
+                why: "sender and recipient are the same agent".to_string(),
+            });
+        }
+        // `RawValue` is guaranteed-valid JSON, so the first meaningful byte
+        // decides the type: an object starts with '{'.
+        if !self.payload.get().trim_start().starts_with('{') {
+            return Err(GaipError::PayloadNotObject);
+        }
+        Ok(())
+    }
+}
+
+/// The outer frame, read in ONE pass with the body captured as a raw
+/// span. A tagged *enum* cannot do this: `#[serde(tag = ...)]` buffers the
+/// whole map into `Content`, which destroys every borrow (a `&RawValue`
+/// inside it fails with "invalid type: newtype struct"). A plain struct
+/// keeps the deserializer in streaming mode, so `body` stays a slice of
+/// the input and is only entered if the tag says REQUEST.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "'de: 'a"))]
+struct FrameView<'a> {
+    /// Read as owned: a hostile tag with escapes must be reported, not
+    /// silently reinterpreted.
+    wire: String,
+    #[serde(default)]
+    request_id: u32,
+    #[serde(default)]
+    contexts: Vec<ServiceContext>,
+    #[serde(default)]
+    body: Option<&'a RawValue>,
+}
+
+/// Decode a frame for a relay: a `REQUEST` comes back as a
+/// [`RoutedRequest`] with its payload untouched; anything else is handed
+/// to [`decode_wire`], so there is exactly one implementation of the other
+/// arms. The pass done here for those frames allocates nothing for the
+/// body — it is captured as a span and never entered.
+pub fn decode_wire_view(buf: &[u8]) -> Result<Option<(WireFrame<'_>, usize)>, GaipError> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len == 0 {
+        return Err(GaipError::BadField {
+            field: "frame",
+            why: "zero-length frame".to_string(),
+        });
+    }
+    if len > MAX_FRAME {
+        return Err(GaipError::FrameTooLarge(len));
+    }
+    if buf.len() < 4 + len {
+        return Ok(None);
+    }
+    let body = &buf[4..4 + len];
+    let view: FrameView = serde_json::from_slice(body)?;
+    if view.wire != "REQUEST" {
+        let (msg, used) = decode_wire(buf)?.expect("frame length already checked");
+        return Ok(Some((WireFrame::Other(msg), used)));
+    }
+    let raw = view.body.ok_or(GaipError::BadField {
+        field: "body",
+        why: "a REQUEST must carry an envelope".to_string(),
+    })?;
+    let env: RoutedEnvelope = serde_json::from_str(raw.get())?;
+    env.validate()?;
+    Ok(Some((
+        WireFrame::Request(RoutedRequest {
+            request_id: view.request_id,
+            contexts: view.contexts,
+            envelope: raw,
+            sender: env.sender,
+            recipient: env.recipient,
+            message_id: env.message_id,
+        }),
+        4 + len,
+    )))
+}
+
+/// Re-frame a `REQUEST` around a body it already had: new contexts, the
+/// envelope bytes untouched. No payload parse, no re-serialization.
+pub fn encode_request_view(
+    request_id: u32,
+    contexts: &[ServiceContext],
+    env_body: &RawValue,
+) -> Result<Vec<u8>, GaipError> {
+    // The envelope goes back in as `RawValue`, so this writes only the
+    // frame's own fields plus the bytes it was handed.
+    #[derive(Serialize)]
+    #[serde(tag = "wire", rename_all = "SCREAMING_SNAKE_CASE")]
+    enum Out<'a> {
+        Request {
+            request_id: u32,
+            // `WireMessage::Request` always emits `contexts` (no skip), so
+            // the re-framed bytes match the original exactly.
+            contexts: &'a [ServiceContext],
+            body: &'a RawValue,
+        },
+    }
+    serialize_framed(
+        &Out::Request {
+            request_id,
+            contexts,
+            body: env_body,
+        },
+        512 + env_body.get().len(),
+    )
 }
 
 /// A refusal expressed as a wire message (GIOP's MessageError) rather
@@ -234,5 +438,123 @@ mod tests {
         let v2 = text.replace("\"1.0\"", "\"2.0\"");
         assert!(version_compatible(&v2).is_err());
         assert!(version_compatible("not json").is_err());
+    }
+
+    // ── the routing view must be behaviourally identical to decode_wire ──
+
+    fn request_frame() -> Vec<u8> {
+        encode_wire(&WireMessage::Request {
+            request_id: 7,
+            contexts: vec![],
+            body: env(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn view_roundtrip_is_byte_identical_when_contexts_are_unchanged() {
+        let frame = request_frame();
+        let (view, used) = decode_wire_view(&frame).unwrap().unwrap();
+        assert_eq!(used, frame.len());
+        let WireFrame::Request(req) = view else {
+            panic!("a REQUEST must take the routing path");
+        };
+        let reframed = encode_request_view(req.request_id, &req.contexts, req.envelope).unwrap();
+        assert_eq!(
+            reframed, frame,
+            "re-framing without touching the contexts must reproduce the bytes"
+        );
+    }
+
+    #[test]
+    fn view_forward_carries_the_payload_and_the_new_contexts() {
+        let frame = request_frame();
+        let (view, _) = decode_wire_view(&frame).unwrap().unwrap();
+        let WireFrame::Request(req) = view else {
+            panic!("expected the routing path");
+        };
+        assert_eq!(req.sender, "urn:agent:python:langgraph:planner-v2");
+        assert_eq!(req.recipient, "urn:agent:rust:tokio:engine");
+        assert_eq!(req.message_id, "msg_1");
+
+        let hop = ServiceContext::new(crate::context::id::ROUTE, "urn:agent:gaip:broker:b1");
+        let forwarded = encode_request_view(7, &[hop], req.envelope).unwrap();
+        let (back, _) = decode_wire(&forwarded).unwrap().unwrap();
+        match back {
+            WireMessage::Request {
+                request_id,
+                contexts,
+                body,
+            } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(contexts.len(), 1);
+                assert_eq!(body.message_id, "msg_1");
+                assert_eq!(
+                    body.payload,
+                    json!({"intent": "INVENTORY_OPTIMIZATION"}),
+                    "the payload survived the passthrough unchanged"
+                );
+            }
+            other => panic!("expected a REQUEST, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_falls_back_to_the_full_parse_for_anything_that_is_not_a_request() {
+        let reply = WireMessage::Reply {
+            request_id: 9,
+            status: ReplyStatus::NoException,
+            body: Some(env()),
+            contexts: vec![],
+        };
+        let frame = encode_wire(&reply).unwrap();
+        match decode_wire_view(&frame).unwrap().unwrap().0 {
+            WireFrame::Other(msg) => assert_eq!(msg, reply),
+            WireFrame::Request(_) => panic!("a REPLY is not a routable request"),
+        }
+    }
+
+    #[test]
+    fn view_refuses_exactly_what_the_full_decode_refuses() {
+        let good = request_frame();
+        let text = String::from_utf8(good[4..].to_vec()).unwrap();
+        let cases = [
+            ("version", text.replace("\"1.0\"", "\"2.0\"")),
+            (
+                "sender",
+                text.replace("urn:agent:python:langgraph:planner-v2", "not-a-urn"),
+            ),
+            (
+                "payload",
+                text.replace(r#"{"intent":"INVENTORY_OPTIMIZATION"}"#, "[1,2,3]"),
+            ),
+            ("primitive", text.replace("TASK_REQUEST", "AGENT_STEP")),
+            ("empty id", text.replace("\"msg_1\"", "\"\"")),
+        ];
+        for (what, body) in cases {
+            let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(body.as_bytes());
+            assert!(
+                decode_wire(&frame).is_err(),
+                "full decode must refuse a bad {what}"
+            );
+            assert!(
+                decode_wire_view(&frame).is_err(),
+                "the routing view must refuse the same bad {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_rejects_a_payload_that_is_not_an_object() {
+        let frame = request_frame();
+        let text = String::from_utf8(frame[4..].to_vec()).unwrap();
+        let body = text.replace(r#"{"intent":"INVENTORY_OPTIMIZATION"}"#, "42");
+        let mut framed = (body.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(body.as_bytes());
+        assert!(matches!(
+            decode_wire_view(&framed).unwrap_err(),
+            GaipError::PayloadNotObject
+        ));
     }
 }

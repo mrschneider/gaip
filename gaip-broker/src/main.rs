@@ -22,9 +22,13 @@
 //! * **Backpressure** — one bounded [`Outbox`] per connection; a stalled
 //!   peer gets a retryable `Unavailable` instead of blocking the broker.
 
-use gaip_core::codec::{decode_wire, encode_wire};
-use gaip_core::context::ContextList;
+use gaip_core::codec::{
+    decode_wire_view, encode_request_view, encode_wire, message_error, WireFrame,
+};
+use gaip_core::context::{ContextList, ServiceContext};
 use gaip_core::dedupe::DedupeCache;
+use gaip_core::envelope::Envelope;
+use gaip_core::error::GaipError;
 use gaip_core::flow::{FlowError, Outbox};
 use gaip_core::message::{ReplyStatus, SystemMinor, WireMessage};
 use serde_json::json;
@@ -109,6 +113,13 @@ impl Broker {
             Err(_) => Err(FlowError::Closed),
         }
     }
+
+    /// Enqueue a frame that is ALREADY encoded (a forwarded request keeps
+    /// the body bytes it arrived with). One `Vec` clone per target, no
+    /// re-serialization.
+    fn send_bytes(conn: &Arc<Conn>, bytes: &[u8]) -> Result<(), FlowError> {
+        conn.out.send(bytes.to_vec())
+    }
 }
 
 /// Resolve the connections a request to `target` should go out on, and
@@ -121,12 +132,13 @@ fn resolve_targets(
     b: &Broker,
     target: &str,
     request_id: u32,
-    body: &gaip_core::envelope::Envelope,
+    sender: &str,
+    message_id: &str,
 ) -> Vec<Arc<Conn>> {
     if let Some(c) = b.conn_for(target) {
         b.pending_local.lock().unwrap().insert(
             (c.id, request_id),
-            (body.sender.clone(), body.message_id.clone()),
+            (sender.to_string(), message_id.to_string()),
         );
         return vec![c];
     }
@@ -136,7 +148,7 @@ fn resolve_targets(
         for c in &used {
             pf.insert(
                 (c.id, request_id),
-                (body.sender.clone(), body.message_id.clone()),
+                (sender.to_string(), message_id.to_string()),
             );
         }
     }
@@ -322,14 +334,16 @@ fn serve_peer(shared: Arc<RwLock<Broker>>, conn: Arc<Conn>, mut stream: TcpStrea
             Err(_) => break,
         }
         loop {
-            match decode_wire(&buf[pos..]) {
-                Ok(Some((msg, used))) => {
+            match decode_wire_view(&buf[pos..]) {
+                Ok(Some((frame, used))) => {
+                    // handle first: the frame borrows `buf`, so the buffer
+                    // cannot be advanced or cleared under it
+                    handle_frame(&shared, &conn, frame);
                     pos += used;
                     if pos == buf.len() {
                         buf.clear();
                         pos = 0;
                     }
-                    handle(&shared, &conn, msg);
                 }
                 Ok(None) => break,
                 Err(_) => {
@@ -359,14 +373,16 @@ fn serve(shared: Arc<RwLock<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
             Err(_) => break,
         }
         loop {
-            match decode_wire(&buf[pos..]) {
-                Ok(Some((msg, used))) => {
+            match decode_wire_view(&buf[pos..]) {
+                Ok(Some((frame, used))) => {
+                    // handle first: the frame borrows `buf`
+                    let keep_going = handle_frame(&shared, &conn, frame);
                     pos += used;
                     if pos == buf.len() {
                         buf.clear();
                         pos = 0;
                     }
-                    if !handle(&shared, &conn, msg) {
+                    if !keep_going {
                         return;
                     }
                 }
@@ -392,6 +408,323 @@ fn serve(shared: Arc<RwLock<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
     if let Some(n) = name {
         shared.write().unwrap().local.remove(&n);
         eprintln!("[broker] {n} disconnected");
+    }
+}
+
+/// What the relay needs from a `REQUEST` — the routing fields plus the
+/// body in whatever form it arrived in.
+struct ReqMeta<'a> {
+    request_id: u32,
+    contexts: Vec<ServiceContext>,
+    sender: String,
+    recipient: String,
+    message_id: String,
+    fwd: ForwardBody<'a>,
+}
+
+impl<'a> ReqMeta<'a> {
+    /// From a fully parsed message (the fallback path).
+    fn parsed(request_id: u32, contexts: Vec<ServiceContext>, body: Envelope) -> Self {
+        Self {
+            request_id,
+            contexts,
+            sender: body.sender.clone(),
+            recipient: body.recipient.clone(),
+            message_id: body.message_id.clone(),
+            fwd: ForwardBody::Parsed(body),
+        }
+    }
+}
+
+/// The envelope as it will be forwarded: the relay never re-encodes a body
+/// it received as bytes.
+enum ForwardBody<'a> {
+    /// Came off the wire: forward the exact envelope bytes.
+    Raw(&'a serde_json::value::RawValue),
+    /// Already a struct (fallback, or built in-process).
+    Parsed(Envelope),
+}
+
+impl ForwardBody<'_> {
+    fn encode(&self, request_id: u32, contexts: &[ServiceContext]) -> Result<Vec<u8>, GaipError> {
+        match self {
+            Self::Raw(envelope) => encode_request_view(request_id, contexts, envelope),
+            Self::Parsed(env) => encode_wire(&WireMessage::Request {
+                request_id,
+                contexts: contexts.to_vec(),
+                body: env.clone(),
+            }),
+        }
+    }
+}
+
+fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'_>) -> bool {
+    let request_id = req.request_id;
+    let contexts = req.contexts;
+    // register the participant by the URN it uses
+    let registered_new = conn.urn.lock().unwrap().is_none();
+    if registered_new {
+        *conn.urn.lock().unwrap() = Some(req.sender.clone());
+    }
+    let mut ctx = ContextList::from_vec(contexts);
+    if registered_new {
+        let mut b = shared.write().unwrap();
+        b.local.insert(req.sender.clone(), conn.clone());
+        // FAILOVER context: the participant advertises where else
+        // it can be reached; the reference outlives the socket
+        if let Some(fail) = ctx.get(gaip_core::context::id::FAILOVER) {
+            let alternates: Vec<String> = fail
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            if !alternates.is_empty() {
+                b.failovers.insert(req.sender.clone(), alternates);
+                if let Some(path) = b.registry_path.clone() {
+                    b.persist_registry(&path);
+                }
+            }
+        }
+        eprintln!("[broker] {} registered", req.sender);
+    }
+    let target = req.recipient.clone();
+
+    // ONE critical section for the whole decision, under the
+    // broker's READ lock: route check, exactly-once lookup,
+    // deadline, negative cache and the first resolution used to
+    // take FIVE separate lock acquisitions per request.
+    // Everything that needs shared state happens here; every
+    // serialization and enqueue happens after the lock is
+    // released.
+    enum Decision {
+        Loop(WireMessage),
+        Replay(WireMessage),
+        Expired(WireMessage),
+        Refusal(WireMessage),
+        Forward {
+            conns: Vec<Arc<Conn>>,
+            retries: u32,
+            backoff: u64,
+        },
+    }
+    let decision = {
+        let b = shared.read().unwrap();
+        let own = b.urn.clone();
+        if ctx.route().contains(&own.as_str()) {
+            Decision::Loop(WireMessage::Reply {
+                request_id,
+                status: ReplyStatus::system(
+                    SystemMinor::ProtocolError,
+                    format!("routing loop: {own} is already in the route"),
+                ),
+                body: None,
+                contexts: Vec::new(),
+            })
+        } else {
+            ctx.push_route(&own);
+            // exactly-once effect: replay the reply of a completed
+            // exchange. The probe runs FIRST, into a local, so the
+            // MutexGuard is released before the else-chain: a guard
+            // held across an `if let` scrutinee would deadlock the
+            // `remember` calls below (std Mutex is not reentrant).
+            let cached = b
+                .dedupe
+                .lock()
+                .unwrap()
+                .lookup_read(&req.sender, &req.message_id);
+            if let Some(WireMessage::Reply { status, body, .. }) = cached {
+                Decision::Replay(WireMessage::Reply {
+                    request_id,
+                    status,
+                    body,
+                    contexts: Vec::new(),
+                })
+            }
+            // DEADLINE AT THE EDGE: an expired absolute deadline
+            // refuses right here — the broker does not spend a
+            // flood on work that cannot start
+            else if let Some(deadline) = ctx.deadline_unix_ms() {
+                if deadline <= gaip_core::context::now_ms() {
+                    let reply = Arc::new(WireMessage::Reply {
+                        request_id,
+                        status: ReplyStatus::system(
+                            SystemMinor::Timeout,
+                            "deadline expired at the broker".to_string(),
+                        ),
+                        body: None,
+                        contexts: Vec::new(),
+                    });
+                    b.dedupe
+                        .lock()
+                        .unwrap()
+                        .remember(&req.sender, &req.message_id, reply.clone());
+                    Decision::Expired(WireMessage::Reply {
+                        request_id,
+                        status: ReplyStatus::system(
+                            SystemMinor::Timeout,
+                            "deadline expired at the broker".to_string(),
+                        ),
+                        body: None,
+                        contexts: Vec::new(),
+                    })
+                } else {
+                    Decision::Forward {
+                        conns: resolve_targets(
+                            &b,
+                            &target,
+                            request_id,
+                            &req.sender,
+                            &req.message_id,
+                        ),
+                        retries: b.retries,
+                        backoff: b.backoff_ms,
+                    }
+                }
+            }
+            // NEGATIVE CACHE: a target whose last attempt died
+            // within the window is refused locally instead of
+            // re-flooding the mesh. The refusal is retryable and
+            // the window is short — the participant that appears
+            // later is found on the next attempt.
+            else if b
+                .dead_ends
+                .get(&target)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
+            {
+                let refusal = ReplyStatus::system(
+                    SystemMinor::ObjectNotExist,
+                    format!(
+                        "{target} was recently unreachable; retry after the negative-cache window"
+                    ),
+                );
+                b.dedupe.lock().unwrap().remember_failure(
+                    &req.sender,
+                    &req.message_id,
+                    refusal.clone(),
+                );
+                Decision::Refusal(WireMessage::Reply {
+                    request_id,
+                    status: refusal,
+                    body: None,
+                    contexts: Vec::new(),
+                })
+            } else {
+                Decision::Forward {
+                    conns: resolve_targets(&b, &target, request_id, &req.sender, &req.message_id),
+                    retries: b.retries,
+                    backoff: b.backoff_ms,
+                }
+            }
+        }
+    };
+
+    match decision {
+        Decision::Loop(reply) | Decision::Expired(reply) | Decision::Refusal(reply) => {
+            let _ = Broker::send_to(conn, &reply);
+            return true;
+        }
+        Decision::Replay(reply) => {
+            let _ = Broker::send_to(conn, &reply);
+            return true;
+        }
+        Decision::Forward {
+            conns,
+            retries,
+            backoff,
+        } => {
+            // One re-frame for every target: only the contexts
+            // change, the envelope bytes ride through untouched.
+            let fwd = match req.fwd.encode(request_id, &ctx.to_vec()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // Adding a hop pushed the frame over MAX_FRAME.
+                    let _ = Broker::send_to(conn, &message_error(e.to_string()));
+                    return true;
+                }
+            };
+            // local first, then peers, with retry: "not yet" ≠ "never".
+            // The FIRST resolution came from the single critical
+            // section above; a retry re-locks only when nothing was
+            // found, because a participant may appear mid-backoff.
+            let mut delivered = !conns.is_empty();
+            for c in &conns {
+                let _ = Broker::send_bytes(c, &fwd);
+            }
+            if !delivered {
+                for attempt in 0..retries {
+                    std::thread::sleep(Duration::from_millis(backoff * (attempt as u64 + 1)));
+                    let conns = {
+                        let b = shared.read().unwrap();
+                        resolve_targets(&b, &target, request_id, &req.sender, &req.message_id)
+                    };
+                    // serialize + enqueue outside the lock: the
+                    // encode of the forwarded request is the
+                    // broker's hottest path
+                    for c in &conns {
+                        let _ = Broker::send_bytes(c, &fwd);
+                    }
+                    if !conns.is_empty() {
+                        delivered = true;
+                        break;
+                    }
+                }
+            }
+            if !delivered {
+                // DEAD LETTER: recorded with the reason, not dropped silently
+                let reply = {
+                    let mut b = shared.write().unwrap();
+                    b.dead_ends
+                        .insert(target.clone(), std::time::Instant::now());
+                    b.dead_letters.push_back((
+                        gaip_core::context::now_ms(),
+                        req.sender.clone(),
+                        target.clone(),
+                        "no reachable broker or participant".to_string(),
+                    ));
+                    while b.dead_letters.len() > 256 {
+                        b.dead_letters.pop_front();
+                    }
+                    b.journal_dead_letter(&req.sender, &target);
+                    let reply = Arc::new(WireMessage::Reply {
+                        request_id,
+                        status: ReplyStatus::system(
+                            SystemMinor::ObjectNotExist,
+                            format!("{target} is not reachable through this broker or its peers"),
+                        ),
+                        body: None,
+                        contexts: Vec::new(),
+                    });
+                    b.dedupe
+                        .lock()
+                        .unwrap()
+                        .remember(&req.sender, &req.message_id, reply.clone());
+                    reply
+                };
+                let _ = Broker::send_to(conn, &reply);
+            }
+        }
+    }
+    true
+}
+
+/// One decoded frame from a read loop: a REQUEST goes through the routing
+/// view (payload carried as bytes, never parsed); everything else is
+/// already a full message.
+fn handle_frame(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, frame: WireFrame<'_>) -> bool {
+    match frame {
+        WireFrame::Request(req) => handle_request(
+            shared,
+            conn,
+            ReqMeta {
+                request_id: req.request_id,
+                contexts: req.contexts,
+                sender: req.sender,
+                recipient: req.recipient,
+                message_id: req.message_id,
+                fwd: ForwardBody::Raw(req.envelope),
+            },
+        ),
+        WireFrame::Other(msg) => handle(shared, conn, msg),
     }
 }
 
@@ -499,243 +832,7 @@ fn handle(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> b
             request_id,
             contexts,
             body,
-        } => {
-            // register the participant by the URN it uses
-            let registered_new = conn.urn.lock().unwrap().is_none();
-            if registered_new {
-                *conn.urn.lock().unwrap() = Some(body.sender.clone());
-            }
-            let mut ctx = ContextList::from_vec(contexts);
-            if registered_new {
-                let mut b = shared.write().unwrap();
-                b.local.insert(body.sender.clone(), conn.clone());
-                // FAILOVER context: the participant advertises where else
-                // it can be reached; the reference outlives the socket
-                if let Some(fail) = ctx.get(gaip_core::context::id::FAILOVER) {
-                    let alternates: Vec<String> = fail
-                        .split(',')
-                        .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect();
-                    if !alternates.is_empty() {
-                        b.failovers.insert(body.sender.clone(), alternates);
-                        if let Some(path) = b.registry_path.clone() {
-                            b.persist_registry(&path);
-                        }
-                    }
-                }
-                eprintln!("[broker] {} registered", body.sender);
-            }
-            let target = body.recipient.clone();
-
-            // ONE critical section for the whole decision, under the
-            // broker's READ lock: route check, exactly-once lookup,
-            // deadline, negative cache and the first resolution used to
-            // take FIVE separate lock acquisitions per request.
-            // Everything that needs shared state happens here; every
-            // serialization and enqueue happens after the lock is
-            // released.
-            enum Decision {
-                Loop(WireMessage),
-                Replay(WireMessage),
-                Expired(WireMessage),
-                Refusal(WireMessage),
-                Forward {
-                    conns: Vec<Arc<Conn>>,
-                    retries: u32,
-                    backoff: u64,
-                },
-            }
-            let decision = {
-                let b = shared.read().unwrap();
-                let own = b.urn.clone();
-                if ctx.route().contains(&own.as_str()) {
-                    Decision::Loop(WireMessage::Reply {
-                        request_id,
-                        status: ReplyStatus::system(
-                            SystemMinor::ProtocolError,
-                            format!("routing loop: {own} is already in the route"),
-                        ),
-                        body: None,
-                        contexts: Vec::new(),
-                    })
-                } else {
-                    ctx.push_route(&own);
-                    // exactly-once effect: replay the reply of a completed
-                    // exchange. The probe runs FIRST, into a local, so the
-                    // MutexGuard is released before the else-chain: a guard
-                    // held across an `if let` scrutinee would deadlock the
-                    // `remember` calls below (std Mutex is not reentrant).
-                    let cached = b
-                        .dedupe
-                        .lock()
-                        .unwrap()
-                        .lookup_read(&body.sender, &body.message_id);
-                    if let Some(WireMessage::Reply { status, body, .. }) = cached {
-                        Decision::Replay(WireMessage::Reply {
-                            request_id,
-                            status,
-                            body,
-                            contexts: Vec::new(),
-                        })
-                    }
-                    // DEADLINE AT THE EDGE: an expired absolute deadline
-                    // refuses right here — the broker does not spend a
-                    // flood on work that cannot start
-                    else if let Some(deadline) = ctx.deadline_unix_ms() {
-                        if deadline <= gaip_core::context::now_ms() {
-                            let reply = Arc::new(WireMessage::Reply {
-                                request_id,
-                                status: ReplyStatus::system(
-                                    SystemMinor::Timeout,
-                                    "deadline expired at the broker".to_string(),
-                                ),
-                                body: None,
-                                contexts: Vec::new(),
-                            });
-                            b.dedupe.lock().unwrap().remember(
-                                &body.sender,
-                                &body.message_id,
-                                reply.clone(),
-                            );
-                            Decision::Expired(WireMessage::Reply {
-                                request_id,
-                                status: ReplyStatus::system(
-                                    SystemMinor::Timeout,
-                                    "deadline expired at the broker".to_string(),
-                                ),
-                                body: None,
-                                contexts: Vec::new(),
-                            })
-                        } else {
-                            Decision::Forward {
-                                conns: resolve_targets(&b, &target, request_id, &body),
-                                retries: b.retries,
-                                backoff: b.backoff_ms,
-                            }
-                        }
-                    }
-                    // NEGATIVE CACHE: a target whose last attempt died
-                    // within the window is refused locally instead of
-                    // re-flooding the mesh. The refusal is retryable and
-                    // the window is short — the participant that appears
-                    // later is found on the next attempt.
-                    else if b
-                        .dead_ends
-                        .get(&target)
-                        .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
-                    {
-                        let refusal = ReplyStatus::system(
-                            SystemMinor::ObjectNotExist,
-                            format!("{target} was recently unreachable; retry after the negative-cache window"),
-                        );
-                        b.dedupe.lock().unwrap().remember_failure(
-                            &body.sender,
-                            &body.message_id,
-                            refusal.clone(),
-                        );
-                        Decision::Refusal(WireMessage::Reply {
-                            request_id,
-                            status: refusal,
-                            body: None,
-                            contexts: Vec::new(),
-                        })
-                    } else {
-                        Decision::Forward {
-                            conns: resolve_targets(&b, &target, request_id, &body),
-                            retries: b.retries,
-                            backoff: b.backoff_ms,
-                        }
-                    }
-                }
-            };
-
-            match decision {
-                Decision::Loop(reply) | Decision::Expired(reply) | Decision::Refusal(reply) => {
-                    let _ = Broker::send_to(conn, &reply);
-                    return true;
-                }
-                Decision::Replay(reply) => {
-                    let _ = Broker::send_to(conn, &reply);
-                    return true;
-                }
-                Decision::Forward {
-                    conns,
-                    retries,
-                    backoff,
-                } => {
-                    let fwd = WireMessage::Request {
-                        request_id,
-                        contexts: ctx.to_vec(),
-                        body: body.clone(),
-                    };
-                    // local first, then peers, with retry: "not yet" ≠ "never".
-                    // The FIRST resolution came from the single critical
-                    // section above; a retry re-locks only when nothing was
-                    // found, because a participant may appear mid-backoff.
-                    let mut delivered = !conns.is_empty();
-                    for c in &conns {
-                        let _ = Broker::send_to(c, &fwd);
-                    }
-                    if !delivered {
-                        for attempt in 0..retries {
-                            std::thread::sleep(Duration::from_millis(
-                                backoff * (attempt as u64 + 1),
-                            ));
-                            let conns = {
-                                let b = shared.read().unwrap();
-                                resolve_targets(&b, &target, request_id, &body)
-                            };
-                            // serialize + enqueue outside the lock: the
-                            // encode of the forwarded request is the
-                            // broker's hottest path
-                            for c in &conns {
-                                let _ = Broker::send_to(c, &fwd);
-                            }
-                            if !conns.is_empty() {
-                                delivered = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !delivered {
-                        // DEAD LETTER: recorded with the reason, not dropped silently
-                        let reply = {
-                            let mut b = shared.write().unwrap();
-                            b.dead_ends
-                                .insert(target.clone(), std::time::Instant::now());
-                            b.dead_letters.push_back((
-                                gaip_core::context::now_ms(),
-                                body.sender.clone(),
-                                target.clone(),
-                                "no reachable broker or participant".to_string(),
-                            ));
-                            while b.dead_letters.len() > 256 {
-                                b.dead_letters.pop_front();
-                            }
-                            b.journal_dead_letter(&body.sender, &target);
-                            let reply = Arc::new(WireMessage::Reply {
-                                request_id,
-                                status: ReplyStatus::system(
-                                    SystemMinor::ObjectNotExist,
-                                    format!("{target} is not reachable through this broker or its peers"),
-                                ),
-                                body: None,
-                                contexts: Vec::new(),
-                            });
-                            b.dedupe.lock().unwrap().remember(
-                                &body.sender,
-                                &body.message_id,
-                                reply.clone(),
-                            );
-                            reply
-                        };
-                        let _ = Broker::send_to(conn, &reply);
-                    }
-                }
-            }
-            true
-        }
+        } => handle_request(shared, conn, ReqMeta::parsed(request_id, contexts, body)),
 
         WireMessage::CancelRequest { .. } | WireMessage::Fragment { .. } => {
             // fragments are handled by participants; a broker forwards
