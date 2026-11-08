@@ -115,10 +115,10 @@ impl Broker {
     }
 
     /// Enqueue a frame that is ALREADY encoded (a forwarded request keeps
-    /// the body bytes it arrived with). One `Vec` clone per target, no
-    /// re-serialization.
-    fn send_bytes(conn: &Arc<Conn>, bytes: &[u8]) -> Result<(), FlowError> {
-        conn.out.send(bytes.to_vec())
+    /// the body bytes it arrived with). One allocation is shared by every
+    /// target via `Arc` — no per-connection copy, no re-serialization.
+    fn send_bytes(conn: &Arc<Conn>, bytes: &std::sync::Arc<[u8]>) -> Result<(), FlowError> {
+        conn.out.send_arc(bytes.clone())
     }
 }
 
@@ -634,8 +634,10 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
         } => {
             // One re-frame for every target: only the contexts
             // change, the envelope bytes ride through untouched.
-            let fwd = match req.fwd.encode(request_id, &ctx.to_vec()) {
-                Ok(bytes) => bytes,
+            // ONE allocation for the whole fan-out: every target
+            // queues a reference to the same bytes.
+            let fwd: std::sync::Arc<[u8]> = match req.fwd.encode(request_id, &ctx.to_vec()) {
+                Ok(bytes) => bytes.into(),
                 Err(e) => {
                     // Adding a hop pushed the frame over MAX_FRAME.
                     let _ = Broker::send_to(conn, &message_error(e.to_string()));

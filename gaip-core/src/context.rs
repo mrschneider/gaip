@@ -10,7 +10,6 @@
 //! gateway can add a trace id to traffic it does not understand.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Context ids. GIOP reserves ranges for the OMG; this is GAIP's own
 /// small registry (0x0001..=0x7FFF), with 0x8000+ left to deployments.
@@ -69,9 +68,15 @@ impl ServiceContext {
 
 /// An ordered, de-duplicated context list (last write wins per id, as in
 /// GIOP where a context id appears at most once).
+///
+/// A `Vec`, not a tree: a GAIP message carries at most a handful of
+/// contexts (trace, deadline, tenant, identity, attempt, route, ...),
+/// and a linear scan of 8 entries beats a BTreeMap's allocations and
+/// comparisons at every hop — this list is rebuilt and serialized on
+/// every relayed request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextList {
-    entries: BTreeMap<u16, String>,
+    entries: Vec<(u16, String)>,
 }
 
 impl ContextList {
@@ -87,24 +92,38 @@ impl ContextList {
         list
     }
 
+    /// Last occurrence wins, mirroring the map this replaced.
+    fn find(&self, id: u16) -> Option<usize> {
+        self.entries.iter().rposition(|(i, _)| *i == id)
+    }
+
     pub fn set(&mut self, id: u16, data: impl Into<String>) -> &mut Self {
-        self.entries.insert(id, data.into());
+        match self.find(id) {
+            Some(i) => self.entries[i].1 = data.into(),
+            None => self.entries.push((id, data.into())),
+        }
         self
     }
 
     pub fn get(&self, id: u16) -> Option<&str> {
-        self.entries.get(&id).map(String::as_str)
+        self.find(id).map(|i| self.entries[i].1.as_str())
     }
 
     pub fn remove(&mut self, id: u16) -> Option<String> {
-        self.entries.remove(&id)
+        let i = self.find(id)?;
+        Some(self.entries.swap_remove(i).1)
     }
 
+    /// Sorted by id: the wire form is deterministic regardless of the
+    /// order in which hops stamped the list.
     pub fn to_vec(&self) -> Vec<ServiceContext> {
-        self.entries
+        let mut v: Vec<ServiceContext> = self
+            .entries
             .iter()
             .map(|(id, data)| ServiceContext::new(*id, data.clone()))
-            .collect()
+            .collect();
+        v.sort_by_key(|c| c.id);
+        v
     }
 
     pub fn trace_id(&self) -> Option<&str> {

@@ -15,6 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
+/// Frames travel the outbox as `Arc<[u8]>`: a broker that fans one
+/// forwarded request out to N target connections shares ONE allocation
+/// across all N queue insertions instead of paying N copies.
+pub type Frame = Arc<[u8]>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowError {
     /// The peer is not draining; the message was NOT queued.
@@ -44,7 +49,7 @@ pub struct OutboxStats {
 
 /// A bounded outbox with its own writer thread.
 pub struct Outbox {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<Frame>,
     capacity: usize,
     sent: Arc<AtomicU64>,
     refused: Arc<AtomicU64>,
@@ -55,7 +60,7 @@ impl Outbox {
     /// Spawn the writer thread around `writer`.
     pub fn spawn<W: Write + Send + 'static>(mut writer: W, capacity: usize) -> Self {
         let capacity = capacity.max(1);
-        let (tx, rx) = sync_channel::<Vec<u8>>(capacity);
+        let (tx, rx) = sync_channel::<Frame>(capacity);
         let sent = Arc::new(AtomicU64::new(0));
         let bytes = Arc::new(AtomicU64::new(0));
         let s = sent.clone();
@@ -63,22 +68,22 @@ impl Outbox {
         std::thread::spawn(move || {
             'outer: while let Ok(first) = rx.recv() {
                 // BATCH DRAIN: everything already queued goes out under
-                // ONE flush. A flush per message defeats coalescing and
-                // turns every small frame into its own syscall round.
-                for chunk in [first] {
-                    if writer.write_all(&chunk).is_err() {
-                        break 'outer; // the peer is gone; the outbox closes
-                    }
-                    s.fetch_add(1, Ordering::Relaxed);
-                    b.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                }
+                // ONE write and ONE flush. A write per message turns
+                // every small frame into its own syscall round; for
+                // TCP the coalesced batch also leaves Nagle's job to
+                // Nagle, not to the queue.
+                let mut batch = Vec::with_capacity(first.len());
+                let mut count = 1u64;
+                batch.extend_from_slice(first.as_ref());
                 while let Ok(next) = rx.try_recv() {
-                    if writer.write_all(&next).is_err() {
-                        break 'outer; // the peer is gone; the outbox closes
-                    }
-                    s.fetch_add(1, Ordering::Relaxed);
-                    b.fetch_add(next.len() as u64, Ordering::Relaxed);
+                    batch.extend_from_slice(next.as_ref());
+                    count += 1;
                 }
+                if writer.write_all(&batch).is_err() {
+                    break 'outer; // the peer is gone; the outbox closes
+                }
+                s.fetch_add(count, Ordering::Relaxed);
+                b.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 let _ = writer.flush();
             }
         });
@@ -94,7 +99,13 @@ impl Outbox {
     /// Queue bytes without blocking. A full queue is a refusal the caller
     /// must translate into a retryable protocol error.
     pub fn send(&self, bytes: Vec<u8>) -> Result<(), FlowError> {
-        match self.tx.try_send(bytes) {
+        self.send_arc(Arc::from(bytes.as_slice()))
+    }
+
+    /// Queue a frame that may already be shared: a fan-out to N targets
+    /// queues the same `Arc<[u8]>` N times and copies nothing.
+    pub fn send_arc(&self, frame: Frame) -> Result<(), FlowError> {
+        match self.tx.try_send(frame) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.refused.fetch_add(1, Ordering::Relaxed);

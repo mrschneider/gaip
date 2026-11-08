@@ -11,7 +11,7 @@
 //! identically instead of running the work again.
 
 use crate::message::{ReplyStatus, WireMessage};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,9 +29,11 @@ pub struct DedupeCache {
     /// URN/restricted text that cannot contain the separator, and one
     /// flat key means one allocation per lookup instead of three (the
     /// tuple plus its two fields) and a single-byte comparison scan.
-    /// BTreeMap stays — `order` is the FIFO eviction window and the
-    /// checkpoint replay depends on deterministic ordering.
-    entries: BTreeMap<String, Remembered>,
+    /// HashMap: the lookup is the hot path (every relayed request probes
+    /// this under the broker's read lock) and is O(1) here, O(log n) in
+    /// a BTreeMap. FIFO order lives in `order`, and the snapshot sorts
+    /// its rows, so checkpoint determinism does not depend on the map.
+    entries: HashMap<String, Remembered>,
     order: VecDeque<String>,
     capacity: usize,
     ttl: Duration,
@@ -41,7 +43,7 @@ pub struct DedupeCache {
 impl DedupeCache {
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: HashMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
             ttl,
@@ -149,7 +151,8 @@ impl DedupeCache {
     /// stored with the milliseconds it still has to live, so a restore
     /// keeps the window honest instead of resetting it.
     pub fn snapshot(&self, now: Instant) -> Vec<(String, String, u128, Arc<WireMessage>)> {
-        self.entries
+        let mut rows: Vec<_> = self
+            .entries
             .iter()
             .filter_map(|(k, r)| {
                 let left = now.duration_since(r.stored_at);
@@ -165,7 +168,12 @@ impl DedupeCache {
                     r.reply.clone(),
                 ))
             })
-            .collect()
+            .collect();
+        // HashMap iteration is unordered; a checkpoint that replayed
+        // entries in a different order each restart would be a lie.
+        // Sort by key only (left_ms is derived, not identity).
+        rows.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
+        rows
     }
 
     /// Restore a checkpoint taken by [`Self::snapshot`].
