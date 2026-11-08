@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
 [![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
-[![Crates.io-style version](https://img.shields.io/badge/version-0.5.5-blue.svg)](releases)
+[![Crates.io-style version](https://img.shields.io/badge/version-0.5.6-blue.svg)](releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Python/LangGraph planner, a Java Spring service and a Rust execution
@@ -139,7 +139,14 @@ experiments/    7 end-to-end proofs
 
 | Version | What landed |
 |---|---|
-| **v0.5.5** | relay without a payload parse: a REQUEST is decoded into a
+| **v0.5.6** | performance round 4: the participant's `decode_wire` REQUEST
+  fast path parses the envelope in ONE streaming pass (raw body span, no
+  intermediate `Value` tree; a missing `payload` is refused, not coerced to
+  `{}`) — 2850 -> 1983 ns per frame; broker fan-out shares one
+  `Arc<[u8]>` across all N target connections, the outbox writes + flushes
+  once per burst, dedupe probes are O(1) (checkpoint replay stays
+  deterministic) and `ContextList` is a linear scan |
+| v0.5.5 | relay without a payload parse: a REQUEST is decoded into a
   routing view (tag, `request_id`, `contexts`, five envelope fields) with the
   envelope carried as raw bytes, so the broker never builds a `Value` tree and
   re-frames the original bytes with the ROUTE context appended. ~1.85x on the
