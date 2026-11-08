@@ -98,6 +98,15 @@ pub fn encode_body(body: Vec<u8>) -> Result<Vec<u8>, GaipError> {
 /// `MessageError`-worthy [`GaipError`]; the caller decides whether to
 /// answer with `WireMessage::MessageError` (GIOP does exactly that
 /// instead of dropping the connection).
+///
+/// `REQUEST` takes a fast path: the tagged *enum* derive would buffer the
+/// whole frame into `Content` (parsing the payload into a map and
+/// re-serializing it for the `Envelope`) before dispatching. The struct
+/// below keeps the deserializer streaming, so the body is captured as a
+/// span and the `Envelope` is parsed straight from it — one pass, no
+/// intermediate tree. Every other tag falls through to the full enum
+/// (one cheap extra pass for the tag, which the rare control frames can
+/// afford).
 pub fn decode_wire(buf: &[u8]) -> Result<Option<(WireMessage, usize)>, GaipError> {
     if buf.len() < 4 {
         return Ok(None);
@@ -115,10 +124,64 @@ pub fn decode_wire(buf: &[u8]) -> Result<Option<(WireMessage, usize)>, GaipError
     if buf.len() < 4 + len {
         return Ok(None);
     }
-    let msg = serde_json::from_slice::<WireMessage>(&buf[4..4 + len])?;
+    let body = &buf[4..4 + len];
+    let view: WireView = serde_json::from_slice(body)?;
+    if view.wire == "REQUEST" {
+        let request_id = view.request_id.ok_or(GaipError::BadField {
+            field: "request_id",
+            why: "a REQUEST must carry a request_id".to_string(),
+        })?;
+        let raw = view.body.ok_or(GaipError::BadField {
+            field: "body",
+            why: "a REQUEST must carry an envelope".to_string(),
+        })?;
+        // One streaming pass straight into the Envelope (derive) +
+        // validate() — no intermediate Value tree, no field-by-field
+        // move-out. The derive only fills fields; validation is the
+        // same validate() the enum path runs. A missing `payload` is
+        // refused (Json), matching from_json: the hot path no longer
+        // coerces a hole into {}.
+        let env = serde_json::from_str::<Envelope>(raw.get())?;
+        env.validate()?;
+        return Ok(Some((
+            WireMessage::Request {
+                request_id,
+                contexts: view.contexts,
+                body: env,
+            },
+            4 + len,
+        )));
+    }
+    // Non-REQUEST frames are small and rare: hand them to the full enum,
+    // which stays the single implementation of the other arms.
+    let msg = serde_json::from_slice::<WireMessage>(body)?;
     // validate the embedded envelope in place — no re-encode/re-parse
     msg.validate_envelopes()?;
     Ok(Some((msg, 4 + len)))
+}
+
+/// The wire fields of a `REQUEST`, read in ONE streaming pass with the
+/// envelope body captured as a raw span.
+///
+/// A tagged *enum* cannot do this: `#[serde(tag = ...)]` buffers the
+/// whole map into `Content`, which both destroys every borrow and pays
+/// for the payload tree twice. A plain struct keeps the deserializer in
+/// streaming mode, so `body` stays a slice of the input and is only
+/// entered when the tag says REQUEST.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "'de: 'a"))]
+struct WireView<'a> {
+    /// Read as owned: a hostile tag with escapes must be reported, not
+    /// silently reinterpreted.
+    wire: String,
+    /// `Option` (not `#[serde(default)]`): a REQUEST without a
+    /// `request_id` must fail exactly as the tagged-enum path does.
+    #[serde(default)]
+    request_id: Option<u32>,
+    #[serde(default)]
+    contexts: Vec<ServiceContext>,
+    #[serde(default)]
+    body: Option<&'a RawValue>,
 }
 
 // ── routing view: relay a REQUEST without parsing its payload ──────────
