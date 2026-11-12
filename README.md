@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
 [![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
-[![Crates.io-style version](https://img.shields.io/badge/version-0.5.6-blue.svg)](releases)
+[![Crates.io-style version](https://img.shields.io/badge/version-0.5.7-blue.svg)](releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Python/LangGraph planner, a Java Spring service and a Rust execution
@@ -97,7 +97,7 @@ before packaging any binary (007, the checkpoint cycle, runs on demand).
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | 143 tests (unit + hostile input + client integration) |
+| `cargo test --workspace` | 147 tests (unit + hostile input + client integration) |
 | GIOP layer end-to-end | 28/28 |
 | Federated brokers end-to-end | 9/9 |
 | NATS (real nats-server) | PASS |
@@ -139,7 +139,15 @@ experiments/    7 end-to-end proofs
 
 | Version | What landed |
 |---|---|
-| **v0.5.6** | performance round 4: the participant's `decode_wire` REQUEST
+| **v0.5.7** | performance round 5: the relay's REPLY leg gets the same treatment
+  as the REQUEST leg — `decode_wire_view` peeks the frame tag from the raw
+  bytes before any serde pass and decodes a REPLY into a routing view whose
+  body stays untouched, and the broker re-frames those same bytes with the
+  hop stamped (`encode_reply_view`) — 1635 ns per relayed reply vs 2589 for
+  the full decode + encode; envelope validation stops paying four String
+  copies per address (`urn::is_valid` walks the bytes once, proven
+  equivalent to `FromStr`) |
+| v0.5.6 | performance round 4: the participant's `decode_wire` REQUEST
   fast path parses the envelope in ONE streaming pass (raw body span, no
   intermediate `Value` tree; a missing `payload` is refused, not coerced to
   `{}`) — 2850 -> 1983 ns per frame; broker fan-out shares one
