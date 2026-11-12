@@ -6,7 +6,7 @@
 //! the schema pins down.
 
 use crate::error::GaipError;
-use crate::urn::AgentUrn;
+use crate::urn;
 use crate::PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -177,12 +177,15 @@ impl Envelope {
             }
         }
         // name the FIELD when an address is bad: "invalid agent URN" alone
-        // does not tell an operator which end of the message is wrong
+        // does not tell an operator which end of the message is wrong.
+        // `urn::is_valid` answers the same question `FromStr` would,
+        // without the four String copies it would immediately drop —
+        // this runs on EVERY decoded message.
         for (field, value) in [("sender", &self.sender), ("recipient", &self.recipient)] {
-            if let Err(e) = value.parse::<AgentUrn>() {
+            if !urn::is_valid(value) {
                 return Err(GaipError::BadField {
                     field,
-                    why: e.to_string(),
+                    why: format!("'{value}' is not a valid agent URN"),
                 });
             }
         }

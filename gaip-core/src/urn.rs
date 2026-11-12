@@ -22,8 +22,36 @@ pub struct AgentUrn {
 fn valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Is `s` a well-formed agent URN, without building the struct?
+///
+/// The hot path (validating an envelope on every decoded message) only
+/// needs the yes/no — `FromStr` pays for four `String` copies and a
+/// `Vec` it immediately drops. This walks the bytes once.
+pub fn is_valid(s: &str) -> bool {
+    let rest = match s.strip_prefix("urn:agent:") {
+        Some(r) => r,
+        None => return false,
+    };
+    // split on ':' without a Vec: at most four segments, counted inline
+    let mut segments = rest.split(':');
+    for _ in 0..3 {
+        match segments.next() {
+            Some(seg) => {
+                if !valid_segment(seg) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    match segments.next() {
+        Some(seg) => valid_segment(seg) && segments.next().is_none(),
+        None => true,
+    }
 }
 
 impl AgentUrn {
@@ -168,6 +196,36 @@ mod tests {
         ] {
             let err = bad.parse::<AgentUrn>().unwrap_err();
             assert!(err.to_string().contains(needle), "'{bad}' -> '{err}'");
+        }
+    }
+
+    #[test]
+    fn is_valid_matches_from_str_without_allocations() {
+        let valid = [
+            "urn:agent:python:langgraph:planner-v2",
+            "urn:agent:java:spring:legacy-connector:2.1",
+            "urn:agent:rust:tokio:engine_1",
+            "urn:agent:a:b:c:d",
+        ];
+        let invalid = [
+            "agent:python:x:y",
+            "urn:agent:python",
+            "urn:agent:python:langgraph",
+            "urn:agent:python:langgraph:planner:v:extra",
+            "urn:agent:py thon:langgraph:x",
+            "urn:agent:python::x",
+        ];
+        for s in valid {
+            assert!(
+                is_valid(s) && s.parse::<AgentUrn>().is_ok(),
+                "'{s}' must be valid"
+            );
+        }
+        for s in invalid {
+            assert!(
+                !is_valid(s) && s.parse::<AgentUrn>().is_err(),
+                "'{s}' must be refused the same way"
+            );
         }
     }
 

@@ -13,7 +13,6 @@ use crate::context::ServiceContext;
 use crate::envelope::{check_version, Envelope, MessageType};
 use crate::error::GaipError;
 use crate::message::{ReplyStatus, SystemMinor, WireMessage};
-use crate::urn::AgentUrn;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -213,11 +212,28 @@ pub struct RoutedRequest<'a> {
     pub message_id: String,
 }
 
+/// The routing half of a `REPLY`: the fields a relay reads, with the body
+/// (when present) still in wire form.
+#[derive(Debug)]
+pub struct RoutedReply<'a> {
+    pub request_id: u32,
+    pub status: ReplyStatus,
+    /// The whole body envelope, byte-for-byte, `None` for a bodyless
+    /// (exception) reply.
+    pub body: Option<&'a RawValue>,
+    pub contexts: Vec<ServiceContext>,
+    /// The reply's destination, read from the body: a `None` body (a
+    /// system exception) has no envelope and is unroutable.
+    pub recipient: Option<String>,
+}
+
 /// A decoded frame: a `REQUEST` a relay can forward without parsing the
-/// payload, or anything else (already a full [`WireMessage`]).
+/// payload, a `REPLY` it can route and forward without re-serializing
+/// the body, or anything else (already a full [`WireMessage`]).
 #[derive(Debug)]
 pub enum WireFrame<'a> {
     Request(RoutedRequest<'a>),
+    Reply(RoutedReply<'a>),
     Other(WireMessage),
 }
 
@@ -229,7 +245,7 @@ pub enum WireFrame<'a> {
 /// is that the payload was checked for shape and never turned into a tree.
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "'de: 'a"))]
-struct RoutedEnvelope<'a> {
+struct EnvelopeView<'a> {
     protocol_version: String,
     message_id: String,
     correlation_id: String,
@@ -243,7 +259,7 @@ struct RoutedEnvelope<'a> {
     payload: &'a RawValue,
 }
 
-impl RoutedEnvelope<'_> {
+impl EnvelopeView<'_> {
     /// The checks [`Envelope::validate`] performs, on borrowed fields.
     fn validate(&self) -> Result<(), GaipError> {
         check_version(&self.protocol_version)?;
@@ -265,10 +281,10 @@ impl RoutedEnvelope<'_> {
             }
         }
         for (field, value) in [("sender", &self.sender), ("recipient", &self.recipient)] {
-            if let Err(e) = value.parse::<AgentUrn>() {
+            if !crate::urn::is_valid(value) {
                 return Err(GaipError::BadField {
                     field,
-                    why: e.to_string(),
+                    why: format!("'{value}' is not a valid agent URN"),
                 });
             }
         }
@@ -296,9 +312,8 @@ impl RoutedEnvelope<'_> {
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "'de: 'a"))]
 struct FrameView<'a> {
-    /// Read as owned: a hostile tag with escapes must be reported, not
-    /// silently reinterpreted.
-    wire: String,
+    /// No `wire` field: the tag was already proven `REQUEST` by the byte
+    /// peek in `wire_tag`, and serde here ignores the unknown key.
     #[serde(default)]
     request_id: u32,
     #[serde(default)]
@@ -308,10 +323,14 @@ struct FrameView<'a> {
 }
 
 /// Decode a frame for a relay: a `REQUEST` comes back as a
-/// [`RoutedRequest`] with its payload untouched; anything else is handed
-/// to [`decode_wire`], so there is exactly one implementation of the other
-/// arms. The pass done here for those frames allocates nothing for the
-/// body — it is captured as a span and never entered.
+/// [`RoutedRequest`] with its payload untouched; a `REPLY` as a
+/// [`RoutedReply`] with its body untouched; anything else is handed to
+/// [`decode_wire`], so there is exactly one implementation of the other
+/// arms.
+///
+/// The tag is peeked from the raw bytes BEFORE any serde pass: a frame
+/// that is not a REQUEST/REPLY (the rare control messages) used to pay a
+/// full view parse and then a full enum parse for the same frame.
 pub fn decode_wire_view(buf: &[u8]) -> Result<Option<(WireFrame<'_>, usize)>, GaipError> {
     if buf.len() < 4 {
         return Ok(None);
@@ -330,28 +349,84 @@ pub fn decode_wire_view(buf: &[u8]) -> Result<Option<(WireFrame<'_>, usize)>, Ga
         return Ok(None);
     }
     let body = &buf[4..4 + len];
-    let view: FrameView = serde_json::from_slice(body)?;
-    if view.wire != "REQUEST" {
-        let (msg, used) = decode_wire(buf)?.expect("frame length already checked");
-        return Ok(Some((WireFrame::Other(msg), used)));
+    match wire_tag(body) {
+        Some("REQUEST") => {
+            let view: FrameView = serde_json::from_slice(body)?;
+            let raw = view.body.ok_or(GaipError::BadField {
+                field: "body",
+                why: "a REQUEST must carry an envelope".to_string(),
+            })?;
+            let env: EnvelopeView = serde_json::from_str(raw.get())?;
+            env.validate()?;
+            Ok(Some((
+                WireFrame::Request(RoutedRequest {
+                    request_id: view.request_id,
+                    contexts: view.contexts,
+                    envelope: raw,
+                    sender: env.sender,
+                    recipient: env.recipient,
+                    message_id: env.message_id,
+                }),
+                4 + len,
+            )))
+        }
+        Some("REPLY") => {
+            let view: ReplyView = serde_json::from_slice(body)?;
+            let recipient = match &view.body {
+                Some(raw) => {
+                    let env: EnvelopeView = serde_json::from_str(raw.get())?;
+                    env.validate()?;
+                    Some(env.recipient)
+                }
+                None => None,
+            };
+            Ok(Some((
+                WireFrame::Reply(RoutedReply {
+                    request_id: view.request_id,
+                    status: view.status,
+                    body: view.body,
+                    contexts: view.contexts,
+                    recipient,
+                }),
+                4 + len,
+            )))
+        }
+        _ => {
+            // not a REQUEST/REPLY: one pass, no wasted view parse
+            let (msg, used) = decode_wire(buf)?.expect("frame length already checked");
+            Ok(Some((WireFrame::Other(msg), used)))
+        }
     }
-    let raw = view.body.ok_or(GaipError::BadField {
-        field: "body",
-        why: "a REQUEST must carry an envelope".to_string(),
-    })?;
-    let env: RoutedEnvelope = serde_json::from_str(raw.get())?;
-    env.validate()?;
-    Ok(Some((
-        WireFrame::Request(RoutedRequest {
-            request_id: view.request_id,
-            contexts: view.contexts,
-            envelope: raw,
-            sender: env.sender,
-            recipient: env.recipient,
-            message_id: env.message_id,
-        }),
-        4 + len,
-    )))
+}
+
+/// Peek the `"wire":"<TAG>"` discriminator out of a frame body without
+/// running serde: the broker's read loop sees REPLY as often as REQUEST,
+/// and the old code paid a full view parse to find out it was neither.
+///
+/// Conservative by design: it only trusts the peek when `"wire"` is the
+/// FIRST key — which is how every frame this protocol's own serializer
+/// produces them (the tag leads). Any other layout (a hostile peer, an
+/// escape in an earlier string) falls back to `None`, and the caller
+/// runs the full serde pass. A misread here would reject a valid frame,
+/// so the peek must be able to fail, never to lie.
+fn wire_tag(body: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(body).ok()?;
+    let s = text.trim_start();
+    if !s.starts_with('{') {
+        return None;
+    }
+    let rest = &s[1..];
+    let open = rest.find('"')?;
+    let close = rest[open + 1..].find('"')?;
+    let key = &rest[open + 1..open + 1 + close];
+    if key != "wire" {
+        return None; // the tag is not first: let serde judge
+    }
+    let after = rest[open + 1 + close + 1..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let v = after.strip_prefix('"')?;
+    let end = v.find('"')?;
+    Some(&v[..end])
 }
 
 /// Re-frame a `REQUEST` around a body it already had: new contexts, the
@@ -381,6 +456,55 @@ pub fn encode_request_view(
             body: env_body,
         },
         512 + env_body.get().len(),
+    )
+}
+
+/// The outer `REPLY` frame, read with the body captured as a raw span.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "'de: 'a"))]
+struct ReplyView<'a> {
+    #[serde(default)]
+    request_id: u32,
+    status: ReplyStatus,
+    #[serde(default)]
+    body: Option<&'a RawValue>,
+    #[serde(default)]
+    contexts: Vec<ServiceContext>,
+}
+
+/// Re-frame a `REPLY` around the body bytes it arrived with: new contexts
+/// (the broker stamps `DELIVERED`), the envelope untouched. The old path
+/// deep-cloned the parsed body under the lock and re-serialized it — for
+/// every reply crossing every broker.
+pub fn encode_reply_view(
+    request_id: u32,
+    status: &ReplyStatus,
+    contexts: &[ServiceContext],
+    body: Option<&RawValue>,
+) -> Result<Vec<u8>, GaipError> {
+    #[derive(Serialize)]
+    #[serde(tag = "wire", rename_all = "SCREAMING_SNAKE_CASE")]
+    enum Out<'a> {
+        Reply {
+            request_id: u32,
+            status: &'a ReplyStatus,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            body: Option<&'a RawValue>,
+            #[serde(skip_serializing_if = "ctx_empty")]
+            contexts: &'a [ServiceContext],
+        },
+    }
+    fn ctx_empty(c: &[ServiceContext]) -> bool {
+        c.is_empty()
+    }
+    serialize_framed(
+        &Out::Reply {
+            request_id,
+            status,
+            body,
+            contexts,
+        },
+        512 + body.map(|b| b.get().len()).unwrap_or(0),
     )
 }
 
@@ -563,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn view_falls_back_to_the_full_parse_for_anything_that_is_not_a_request() {
+    fn reply_takes_the_routing_path_and_reframes_its_body_untouched() {
         let reply = WireMessage::Reply {
             request_id: 9,
             status: ReplyStatus::NoException,
@@ -571,9 +695,93 @@ mod tests {
             contexts: vec![],
         };
         let frame = encode_wire(&reply).unwrap();
+        let (view, used) = decode_wire_view(&frame).unwrap().unwrap();
+        assert_eq!(used, frame.len());
+        let WireFrame::Reply(rep) = view else {
+            panic!("a REPLY must take the routing path");
+        };
+        assert_eq!(rep.request_id, 9);
+        assert_eq!(rep.status, ReplyStatus::NoException);
+        assert_eq!(
+            rep.recipient.as_deref(),
+            Some("urn:agent:rust:tokio:engine")
+        );
+        let body = rep.body.as_ref().unwrap();
+        // stamp a hop and re-frame: the envelope bytes must survive verbatim
+        let hop = ServiceContext::new(crate::context::id::ROUTE, "urn:agent:gaip:broker:b1");
+        let out = encode_reply_view(
+            9,
+            &ReplyStatus::NoException,
+            std::slice::from_ref(&hop),
+            Some(body),
+        )
+        .unwrap();
+        let (back, _) = decode_wire(&out).unwrap().unwrap();
+        match back {
+            WireMessage::Reply {
+                request_id,
+                contexts,
+                body: b,
+                ..
+            } => {
+                assert_eq!(request_id, 9);
+                assert_eq!(contexts, vec![hop.clone()]);
+                assert_eq!(b.as_ref().unwrap().message_id, "msg_1");
+            }
+            other => panic!("expected a REPLY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bodyless_exception_reply_has_no_recipient_and_no_body_key() {
+        let reply = WireMessage::Reply {
+            request_id: 10,
+            status: ReplyStatus::system(SystemMinor::ObjectNotExist, "gone"),
+            body: None,
+            contexts: vec![],
+        };
+        let frame = encode_wire(&reply).unwrap();
+        let (view, _) = decode_wire_view(&frame).unwrap().unwrap();
+        let WireFrame::Reply(rep) = view else {
+            panic!("expected the routing path");
+        };
+        assert!(rep.body.is_none());
+        assert!(rep.recipient.is_none(), "an exception reply is unroutable");
+        let out = encode_reply_view(
+            10,
+            &ReplyStatus::system(SystemMinor::ObjectNotExist, "gone"),
+            &[],
+            None,
+        )
+        .unwrap();
+        let text = String::from_utf8(out[4..].to_vec()).unwrap();
+        assert!(
+            !text.contains("\"body\""),
+            "bodyless reply must omit body: {text}"
+        );
+    }
+
+    #[test]
+    fn wire_tag_only_trusts_a_leading_wire_key() {
+        assert_eq!(
+            wire_tag(br#"{"wire":"REQUEST","request_id":1}"#),
+            Some("REQUEST")
+        );
+        assert_eq!(wire_tag(b"  {\"wire\":\"REPLY\"}"), Some("REPLY"));
+        // tag not first: let serde judge, the peek must not
+        assert_eq!(wire_tag(br#"{"request_id":1,"wire":"REQUEST"}"#), None);
+        assert_eq!(wire_tag(b"[1,2,3]"), None);
+        assert_eq!(wire_tag(b"null"), None);
+        assert_eq!(wire_tag(br#"{"note":"wire","request_id":1}"#), None);
+    }
+
+    #[test]
+    fn view_falls_back_to_the_full_parse_for_control_messages() {
+        let msg = message_error("refused");
+        let frame = encode_wire(&msg).unwrap();
         match decode_wire_view(&frame).unwrap().unwrap().0 {
-            WireFrame::Other(msg) => assert_eq!(msg, reply),
-            WireFrame::Request(_) => panic!("a REPLY is not a routable request"),
+            WireFrame::Other(back) => assert_eq!(back, msg),
+            other => panic!("a control message is not routable, got {other:?}"),
         }
     }
 

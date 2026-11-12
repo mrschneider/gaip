@@ -3,14 +3,15 @@
 //! body bytes untouched).
 //! Run with: cargo run --release -p gaip-core --example bench_wire [-- N]
 use gaip_core::codec::{
-    decode_wire, decode_wire_view, encode_body, encode_request_view, encode_wire, WireFrame,
+    decode_wire, decode_wire_view, encode_body, encode_reply_view, encode_request_view,
+    encode_wire, WireFrame,
 };
 use gaip_core::envelope::{Envelope, MessageType};
-use gaip_core::message::WireMessage;
+use gaip_core::message::{ReplyStatus, WireMessage};
 use std::time::Instant;
 
-fn sample_msg() -> WireMessage {
-    let env = Envelope::new(
+fn sample_env() -> Envelope {
+    Envelope::new(
         "msg_bench_0001".to_string(),
         "task_bench_0001".to_string(),
         "urn:agent:python:langgraph:planner-v2".to_string(),
@@ -24,11 +25,14 @@ fn sample_msg() -> WireMessage {
             "artifacts_ref": [],
             "notes": "synthetic payload sized like a typical request (~617 bytes of JSON)"
         }),
-    );
+    )
+}
+
+fn sample_msg() -> WireMessage {
     WireMessage::Request {
         request_id: 7,
         contexts: vec![],
-        body: env,
+        body: sample_env(),
     }
 }
 
@@ -83,6 +87,21 @@ fn main() {
                 "urn:agent:gaip:broker:b1",
             );
             let _ = encode_request_view(req.request_id, &[hop], req.envelope);
+        }
+    });
+    // The REPLY leg of the same relay: a participant answers, the broker
+    // routes the reply to the origin and re-frames with the hop stamped —
+    // body bytes carried verbatim, no Value tree.
+    let reply = WireMessage::reply(7, sample_env());
+    let reply_bytes = encode_wire(&reply).unwrap();
+    bench("relay: reply view + reframe", iters, || {
+        let (frame, _) = decode_wire_view(&reply_bytes).unwrap().unwrap();
+        if let WireFrame::Reply(rep) = frame {
+            let hop = gaip_core::ServiceContext::new(
+                gaip_core::context::id::ROUTE,
+                "urn:agent:gaip:broker:b1",
+            );
+            let _ = encode_reply_view(rep.request_id, &ReplyStatus::NoException, &[hop], rep.body);
         }
     });
     let body = serde_json::to_vec(&msg).unwrap();
