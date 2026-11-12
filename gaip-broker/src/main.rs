@@ -23,7 +23,8 @@
 //!   peer gets a retryable `Unavailable` instead of blocking the broker.
 
 use gaip_core::codec::{
-    decode_wire_view, encode_request_view, encode_wire, message_error, WireFrame,
+    decode_wire_view, encode_reply_view, encode_request_view, encode_wire, message_error,
+    RoutedReply, WireFrame,
 };
 use gaip_core::context::{ContextList, ServiceContext};
 use gaip_core::dedupe::DedupeCache;
@@ -726,8 +727,86 @@ fn handle_frame(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, frame: WireFrame
                 fwd: ForwardBody::Raw(req.envelope),
             },
         ),
+        WireFrame::Reply(reply) => handle_reply_view(shared, conn, &reply),
         WireFrame::Other(msg) => handle(shared, conn, msg),
     }
+}
+
+/// REPLY fast path: the body arrives as raw wire bytes (a [`RoutedReply`]),
+/// so the relay routes on the envelope's recipient and forwards the bytes
+/// it received — no parse into a `Value` tree, no re-serialization. The
+/// exactly-once bookkeeping needs an owned `Envelope`, so that one is
+/// materialized (as the old full-message path already did) and only the
+/// dedupe cache sees it; the wire gets `encode_reply_view` splicing the
+/// original bytes back.
+fn handle_reply_view(
+    shared: &Arc<RwLock<Broker>>,
+    conn: &Arc<Conn>,
+    reply: &RoutedReply<'_>,
+) -> bool {
+    // DELIVERED: this broker handed the request to a LOCAL participant —
+    // stamp the reply so the origin knows delivery was acknowledged, not
+    // assumed. READ lock: recipient resolution and the pending lookup are
+    // pure reads; only the short inner Mutexes are written, and the encode
+    // happens AFTER the guard drops, off the global lock.
+    let mut target_conn = None;
+    let stamped = {
+        let b = shared.read().unwrap();
+        // LOCAL delivery first (the hot path), then the flood map: both
+        // entries are REMOVED here, so neither map can grow without bound.
+        let key = (conn.id, reply.request_id);
+        let local = b.pending_local.lock().unwrap().remove(&key);
+        let delivered_here = local.is_some();
+        let pending = local.or_else(|| b.pending_flood.lock().unwrap().remove(&key));
+        let mut stamped = reply.contexts.clone();
+        if delivered_here {
+            stamped.insert(
+                0,
+                gaip_core::ServiceContext::new(gaip_core::context::id::DELIVERED, b.urn.clone()),
+            );
+        }
+        // exactly-once: remember the reply against the request that caused
+        // it, using the (connection, request_id) the broker handed out.
+        // The dedupe cache stores an owned `WireMessage` (replayed on
+        // retry), so the body is materialized once — the forwarded bytes
+        // below stay the originals.
+        if let Some((sender, msg_id)) = pending {
+            let body = reply
+                .body
+                .map(|raw| serde_json::from_str::<gaip_core::envelope::Envelope>(raw.get()))
+                .transpose()
+                .ok()
+                .flatten();
+            b.dedupe.lock().unwrap().remember(
+                &sender,
+                &msg_id,
+                WireMessage::Reply {
+                    request_id: reply.request_id,
+                    status: reply.status.clone(),
+                    body,
+                    contexts: stamped.clone(),
+                },
+            );
+        }
+        // a reply travels to the envelope's recipient: a bodyless reply
+        // (system exception) is unroutable and dropped, like before.
+        if let Some(target) = &reply.recipient {
+            target_conn = b.conn_for(target);
+        }
+        stamped
+    };
+    if let Some(c) = target_conn {
+        let bytes = encode_reply_view(reply.request_id, &reply.status, &stamped, reply.body).ok();
+        if let Some(bytes) = bytes {
+            let _ = Broker::send_bytes(&c, &Arc::from(bytes));
+        } else {
+            eprintln!(
+                "[broker] reply encode failed (request {id})",
+                id = reply.request_id
+            );
+        }
+    }
+    true
 }
 
 fn handle(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> bool {
