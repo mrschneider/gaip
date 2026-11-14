@@ -74,6 +74,11 @@ impl Offer {
     pub fn number(&self, key: &str) -> Option<i64> {
         self.attributes.get(key).and_then(AttrValue::as_number)
     }
+
+    /// The attribute's text value, when it is text.
+    pub fn text(&self, key: &str) -> Option<&str> {
+        self.attributes.get(key).and_then(AttrValue::as_text)
+    }
 }
 
 /// A conjunction of constraints. Every field is optional; an empty query
@@ -520,6 +525,19 @@ impl Trader {
         hits
     }
 
+    /// [`Self::query`], but returning owned [`Offer`]s instead of borrows.
+    ///
+    /// `query` hands back `Vec<&Offer>` whose lifetime is the Trader's,
+    /// so the hits cannot outlive the call site — they cannot cross a
+    /// `send` to a worker task, be stored in a struct, or outlive a lock
+    /// guard. This clones the matching offers in the same best-first
+    /// order, so the result is free to move anywhere. Use `query` when
+    /// the hits are consumed in place (no clone), `query_owned` when they
+    /// must travel.
+    pub fn query_owned(&self, q: &Query) -> Vec<Offer> {
+        self.query(q).into_iter().map(|o| o.clone()).collect()
+    }
+
     pub fn best(&self, q: &Query) -> Option<&Offer> {
         // Only the top hit is wanted: a full sort is O(n log n) for an
         // answer one `max_by` finds in O(n). `max_by` takes an ASCENDING
@@ -727,5 +745,42 @@ mod tests {
         assert!(t.withdraw("urn:agent:rust:tokio:engine-b"));
         assert!(!t.withdraw("urn:agent:rust:tokio:engine-b"));
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn query_owned_returns_the_same_hits_as_query() {
+        let t = fixture();
+        let q = Query::new()
+            .capability("INVENTORY_OPTIMIZATION")
+            .at_least("vram_free_mb", 32_000);
+        let borrowed = t.query(&q);
+        let owned = t.query_owned(&q);
+        assert_eq!(borrowed.len(), owned.len());
+        // same best-first order, owned copies usable after `t` is dropped
+        let urns: Vec<String> = owned.iter().map(|o| o.ior.urn.clone()).collect();
+        assert_eq!(urns, vec!["urn:agent:rust:tokio:engine-a".to_string()]);
+        // a no-match query yields an empty owned vec, not a panic
+        assert!(t
+            .query_owned(&Query::new().capability("NO_SUCH_CAP"))
+            .is_empty());
+    }
+
+    #[test]
+    fn text_accessor_is_the_mirror_of_number() {
+        let o = offer(
+            "urn:agent:rust:tokio:engine-a",
+            "10.0.0.1:7610",
+            &[],
+            1024,
+            "rust",
+        );
+        assert_eq!(o.text("runtime"), Some("rust"));
+        assert_eq!(o.number("vram_free_mb"), Some(1024));
+        // a numeric attribute has no text view and vice versa
+        assert_eq!(o.text("vram_free_mb"), None);
+        assert_eq!(o.number("runtime"), None);
+        // a missing attribute is None either way
+        assert_eq!(o.text("nope"), None);
+        assert_eq!(o.number("nope"), None);
     }
 }

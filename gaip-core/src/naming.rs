@@ -115,6 +115,49 @@ impl NamingService {
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    /// Serialize the whole binding table to JSON.
+    ///
+    /// The in-memory table is the only copy of the bindings: a naming
+    /// service that dies on restart turns every caller into a config file
+    /// again. This is the form a registry writes to disk (or a checkpoint
+    /// path) so a rebinding survives the process. Each row is a
+    /// `["name", "IOR:..."]` pair; the IOR travels as its full form, which
+    /// carries the failover list and capabilities, so no second lookup is
+    /// needed to restore it.
+    pub fn to_json(&self) -> Result<String, GaipError> {
+        let rows: Vec<(String, String)> = self
+            .bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        serde_json::to_string(&rows).map_err(|e| GaipError::BadField {
+            field: "naming",
+            why: format!("serialize: {e}"),
+        })
+    }
+
+    /// Restore a table written by [`Self::to_json`].
+    ///
+    /// Every name and every IOR is re-validated on the way in, so a
+    /// corrupt or hand-edited file is refused whole rather than letting a
+    /// bad reference into the table (the same rule `bind` enforces). The
+    /// table starts empty: a failure restores nothing.
+    pub fn from_json(s: &str) -> Result<Self, GaipError> {
+        let rows: Vec<(String, String)> = serde_json::from_str(s).map_err(|e| GaipError::BadField {
+            field: "naming",
+            why: format!("deserialize: {e}"),
+        })?;
+        let mut ns = Self::new();
+        for (name, ior_text) in rows {
+            let ior: Ior = ior_text.parse()?;
+            // rebind, not bind: a duplicate row in the file is a
+            // last-write-wins restore, not an error worth refusing the
+            // whole table for.
+            ns.rebind(&name, ior)?;
+        }
+        Ok(ns)
+    }
 }
 
 #[cfg(test)]
@@ -203,5 +246,58 @@ mod tests {
         assert!(ns.unbind("swarm/a"));
         assert!(!ns.unbind("swarm/a"));
         assert!(ns.resolve("swarm/a").is_none());
+    }
+
+    #[test]
+    fn the_binding_table_round_trips_through_json() {
+        let mut ns = NamingService::new();
+        ns.bind(
+            "swarm/backend/engine-1",
+            ior("engine-1", "10.0.0.7:7610"),
+        )
+        .unwrap();
+        ns.bind("swarm/engine/standby", ior("standby", "10.0.0.2:7610"))
+            .unwrap();
+
+        let wire = ns.to_json().unwrap();
+        let back = NamingService::from_json(&wire).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(
+            back.resolve("swarm/backend/engine-1")
+                .unwrap()
+                .primary_endpoint(),
+            Some("10.0.0.7:7610")
+        );
+        // capabilities and version ride along in the IOR's full form
+        let rich = Ior::new("urn:agent:rust:tokio:big", vec!["10.0.0.9:7610".into()], "2.1")
+            .with_capabilities(vec!["DEMAND_FORECAST".into()]);
+        ns.rebind("swarm/big", rich).unwrap();
+        let wire2 = ns.to_json().unwrap();
+        let back2 = NamingService::from_json(&wire2).unwrap();
+        let restored = back2.resolve("swarm/big").unwrap();
+        assert!(restored.has_capability("DEMAND_FORECAST"));
+        assert_eq!(restored.version, "2.1");
+    }
+
+    #[test]
+    fn an_empty_table_round_trips_to_an_empty_table() {
+        let ns = NamingService::new();
+        let wire = ns.to_json().unwrap();
+        assert_eq!(wire, "[]");
+        let back = NamingService::from_json(&wire).unwrap();
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_table_is_refused_whole() {
+        // not JSON at all
+        assert!(NamingService::from_json("nope").is_err());
+        // valid JSON, but the IOR field is not a valid reference: a bad
+        // row must not create a partial table
+        let bad = r#"[["a/b", "not-an-ior"]]"#;
+        let err = NamingService::from_json(bad).unwrap_err();
+        assert!(err.to_string().contains("naming") || err.to_string().contains("IOR"), "{err}");
+        // valid JSON, wrong shape (a bare string, not a [name, ior] pair)
+        assert!(NamingService::from_json(r#""just-a-string""#).is_err());
     }
 }
