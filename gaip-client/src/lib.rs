@@ -170,12 +170,13 @@ impl Client {
             field: "connect",
             why: "not connected".to_string(),
         })?;
+        // A write that fails before any reply byte is safe to retry on the
+        // next endpoint: the request either never left or died in the
+        // socket. (The old string-match on the io error would have missed
+        // "Broken pipe" and surfaced it without a failover.)
         s.write_all(bytes)
             .and_then(|_| s.flush())
-            .map_err(|e| GaipError::BadField {
-                field: "write",
-                why: e.to_string(),
-            })
+            .map_err(|e| Self::e_transient_no_reply(&format!("write failed: {e}")))
     }
 
     /// Read one wire message; `Ok(None)` on a read timeout.
@@ -215,10 +216,7 @@ impl Client {
             let s = self.stream.as_mut().unwrap();
             match s.read(&mut chunk) {
                 Ok(0) => {
-                    return Err(GaipError::BadField {
-                        field: "read",
-                        why: "connection closed by peer".to_string(),
-                    })
+                    return Err(Self::e_transient_no_reply("connection closed by peer"))
                 }
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(e)
@@ -313,17 +311,18 @@ impl Client {
                 }
                 Some(m @ WireMessage::Reply { .. }) => streams.push(m),
                 Some(_) => {}
-                None => return Err(Self::e_transient_no_reply()),
+                None => return Err(Self::e_transient_no_reply("no reply before the read deadline")),
             }
         }
         Ok(Exchange { reply, streams })
     }
 
-    fn e_transient_no_reply() -> GaipError {
-        GaipError::BadField {
-            field: "read",
-            why: "connection closed before a reply".to_string(),
-        }
+    /// The typed "safe to retry" signal: raised at the exact moment the
+    /// CORBA messaging rule holds (no reply byte arrived), so the failover
+    /// loop's `is_transient_no_reply` check is a variant match, not a guess
+    /// at the wording of a message.
+    fn e_transient_no_reply(why: &str) -> GaipError {
+        GaipError::TransientNoReply(why.to_string())
     }
 
     /// Grant stream credits to the server (flow control).

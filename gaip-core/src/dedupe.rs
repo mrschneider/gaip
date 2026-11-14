@@ -77,7 +77,13 @@ impl DedupeCache {
                 Some(r.reply.as_ref().clone())
             }
             Some(_) => {
+                // Drop it from BOTH maps. Leaving the key in `order` would
+                // let a later `remember` pop it as "oldest", no-op the
+                // eviction, and insert past capacity (the window growing
+                // past its declared bound). `sweep` already keeps this
+                // invariant; a lazy `lookup` eviction must too.
                 self.entries.remove(&key);
+                self.order.retain(|k| k != &key);
                 None
             }
             None => None,
@@ -107,9 +113,16 @@ impl DedupeCache {
     pub fn remember(&mut self, sender: &str, message_id: &str, reply: impl Into<Arc<WireMessage>>) {
         let reply = reply.into();
         let key = Self::key(sender, message_id);
-        if self.entries.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+        // Evict until there is a real free slot. `order` can hold keys
+        // that are no longer in `entries` (an expired entry reclaimed by a
+        // `lookup`), so one pop may be a no-op: loop, skipping stale keys,
+        // until a slot opens or `order` is empty. The bound is on
+        // `entries` — the window — never on the FIFO.
+        while self.entries.len() >= self.capacity {
+            match self.order.pop_front() {
+                Some(oldest) if self.entries.remove(&oldest).is_some() => {}
+                Some(_) => continue,
+                None => break,
             }
         }
         self.order.push_back(key.clone());
@@ -265,6 +278,34 @@ mod tests {
         assert!(c.lookup("a", "1").is_none(), "the oldest left the window");
         assert!(c.lookup("a", "2").is_some());
         assert!(c.lookup("a", "3").is_some());
+    }
+
+    #[test]
+    fn lazy_lookup_eviction_keeps_the_window_bounded() {
+        // Regression: an expired entry reclaimed *lazily* by `lookup` (not
+        // by `sweep`) used to leave its key stranded in the FIFO. With the
+        // window then full, the next `remember` popped that stale key,
+        // no-opped the eviction, and inserted a fresh entry PAST the
+        // declared capacity — the window grew without bound.
+        let mut c = DedupeCache::new(2, Duration::from_millis(5));
+        c.remember("a", "1", reply("1"));
+        c.remember("a", "2", reply("2"));
+        // Expire both, then reclaim one lazily via `lookup`.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(c.lookup("a", "1").is_none(), "expired: must not replay");
+        // Two more inserts: the window is full, so each must evict a real
+        // entry. The old code no-opped the first eviction (stale FIFO head)
+        // and let `len` climb to 3.
+        c.remember("a", "3", reply("3"));
+        c.remember("a", "4", reply("4"));
+        assert!(
+            c.len() <= 2,
+            "the window must never exceed its capacity, got {}",
+            c.len()
+        );
+        assert!(c.lookup("a", "2").is_none(), "a2 should have been evicted");
+        assert!(c.lookup("a", "3").is_some());
+        assert!(c.lookup("a", "4").is_some());
     }
 
     #[test]

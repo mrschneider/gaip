@@ -43,6 +43,14 @@ pub enum GaipError {
     FrameTooLarge(usize),
     Truncated,
     Json(String),
+    /// A transport failure that happened **before any reply byte**: the
+    /// request may not have been processed, so a failover retry on the
+    /// next endpoint is safe. The client raises this for write errors, a
+    /// peer that closed without answering, and a read that died mid-way;
+    /// the broker never does. Keeping it a variant — instead of matching
+    /// the wording of a `BadField` message — is what makes the failover
+    /// decision precise instead of a string guess.
+    TransientNoReply(String),
 }
 
 impl fmt::Display for GaipError {
@@ -76,6 +84,7 @@ impl fmt::Display for GaipError {
             Self::FrameTooLarge(n) => write!(f, "frame of {n} bytes exceeds the cap"),
             Self::Truncated => write!(f, "truncated frame"),
             Self::Json(e) => write!(f, "malformed JSON: {e}"),
+            Self::TransientNoReply(why) => write!(f, "no reply received, retry is safe: {why}"),
         }
     }
 }
@@ -90,10 +99,11 @@ impl From<serde_json::Error> for GaipError {
 
 impl GaipError {
     /// True when the failure happened before any reply byte: the request
-    /// may not have been processed, so a failover retry is safe.
+    /// may not have been processed, so a failover retry is safe. This is
+    /// a *typed* decision — the transport raises [`Self::TransientNoReply`]
+    /// at the exact moment the rule holds — so a failover policy never
+    /// has to guess from the wording of an error message.
     pub fn is_transient_no_reply(&self) -> bool {
-        matches!(self, GaipError::BadField { field, why }
-            if (field == &"write" || field == &"read")
-                && (why.contains("closed") || why.contains("write") || why.contains("connect")))
+        matches!(self, GaipError::TransientNoReply(_))
     }
 }
