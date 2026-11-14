@@ -535,7 +535,7 @@ impl Trader {
     /// the hits are consumed in place (no clone), `query_owned` when they
     /// must travel.
     pub fn query_owned(&self, q: &Query) -> Vec<Offer> {
-        self.query(q).into_iter().map(|o| o.clone()).collect()
+        self.query(q).into_iter().cloned().collect()
     }
 
     pub fn best(&self, q: &Query) -> Option<&Offer> {

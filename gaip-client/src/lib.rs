@@ -215,9 +215,7 @@ impl Client {
             let mut chunk = [0u8; 16384];
             let s = self.stream.as_mut().unwrap();
             match s.read(&mut chunk) {
-                Ok(0) => {
-                    return Err(Self::e_transient_no_reply("connection closed by peer"))
-                }
+                Ok(0) => return Err(Self::e_transient_no_reply("connection closed by peer")),
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -311,7 +309,11 @@ impl Client {
                 }
                 Some(m @ WireMessage::Reply { .. }) => streams.push(m),
                 Some(_) => {}
-                None => return Err(Self::e_transient_no_reply("no reply before the read deadline")),
+                None => {
+                    return Err(Self::e_transient_no_reply(
+                        "no reply before the read deadline",
+                    ))
+                }
             }
         }
         Ok(Exchange { reply, streams })
