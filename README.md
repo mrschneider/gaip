@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
 [![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
-[![Crates.io-style version](https://img.shields.io/badge/version-0.5.7-blue.svg)](releases)
+[![Crates.io-style version](https://img.shields.io/badge/version-0.5.8-blue.svg)](releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Python/LangGraph planner, a Java Spring service and a Rust execution
@@ -97,7 +97,7 @@ before packaging any binary (007, the checkpoint cycle, runs on demand).
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | 147 tests (unit + hostile input + client integration) |
+| `cargo test --workspace` | 153 tests (unit + hostile input + client integration) |
 | GIOP layer end-to-end | 28/28 |
 | Federated brokers end-to-end | 9/9 |
 | NATS (real nats-server) | PASS |
@@ -139,7 +139,18 @@ experiments/    7 end-to-end proofs
 
 | Version | What landed |
 |---|---|
-| **v0.5.7** | performance round 5: the relay's REPLY leg gets the same treatment
+| **v0.5.8** | reliability + persistence: the client's failover decision is now a
+  typed `TransientNoReply` variant match instead of a string guess on a
+  `BadField` message (a "Broken pipe" on write used to fall through as
+  permanent and never trigger failover); the dedupe cache's lazy eviction
+  no longer strands keys in the FIFO, so the window stays bounded at its
+  declared capacity; the naming table round-trips through JSON
+  (`to_json`/`from_json` re-validates every name and IOR on the way in,
+  so a corrupt file is refused whole); `Trader::query_owned` returns
+  owned offers that can cross a `send` or outlive a lock guard;
+  `Offer::text` mirrors `number` for text attributes. Test count
+  147 → 153 |
+| v0.5.7 | performance round 5: the relay's REPLY leg gets the same treatment
   as the REQUEST leg — `decode_wire_view` peeks the frame tag from the raw
   bytes before any serde pass and decodes a REPLY into a routing view whose
   body stays untouched, and the broker re-frames those same bytes with the
