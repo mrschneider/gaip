@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
 [![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
-[![Crates.io-style version](https://img.shields.io/badge/version-0.5.8-blue.svg)](releases)
+[![Crates.io-style version](https://img.shields.io/badge/version-0.5.9-blue.svg)](releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Python/LangGraph planner, a Java Spring service and a Rust execution
@@ -97,7 +97,7 @@ before packaging any binary (007, the checkpoint cycle, runs on demand).
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | 153 tests (unit + hostile input + client integration) |
+| `cargo test --workspace` | 154 tests (unit + hostile input + client integration) |
 | GIOP layer end-to-end | 28/28 |
 | Federated brokers end-to-end | 9/9 |
 | NATS (real nats-server) | PASS |
@@ -139,7 +139,16 @@ experiments/    7 end-to-end proofs
 
 | Version | What landed |
 |---|---|
-| **v0.5.8** | reliability + persistence: the client's failover decision is now a
+| **v0.5.9** | performance round 6: the broker's relay path no longer parses a
+  relayed reply's body into an `Envelope` tree just to cache it — the exactly-once
+  bookkeeping stores the body's wire bytes (`remember_raw`) and materializes them
+  only on the rare replay/checkpoint, removing ~1 µs of serde from the hot path per
+  relayed reply; the engine's `InterfaceRepository` is now shared process-wide
+  (one `Arc<RwLock>`) instead of cloned per connection, so a schema sync on any
+  socket is visible to all peers; the broker's routing-loop check scans the route
+  in place (`route_contains`) instead of building a `Vec` per request. Test count
+  153 → 154 |
+| v0.5.8 | reliability + persistence: the client's failover decision is now a
   typed `TransientNoReply` variant match instead of a string guess on a
   `BadField` message (a "Broken pipe" on write used to fall through as
   permanent and never trigger failover); the dedupe cache's lazy eviction
