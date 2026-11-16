@@ -4,18 +4,18 @@
 
 [![CI](https://github.com/mrschneider/gaip/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/ci.yml)
 [![Release](https://github.com/mrschneider/gaip/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/gaip/actions/workflows/release.yml)
-[![Crates.io-style version](https://img.shields.io/badge/version-0.5.9-blue.svg)](releases)
+[![Version](https://img.shields.io/badge/version-0.5.9-blue.svg)](releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Python/LangGraph planner, a Java Spring service and a Rust execution
-engine speak different shapes of the same ideas. Integrating them is
-translators — fragile, per-pair, drifting. GAIP gives them **one typed
-envelope, six universal primitives and transports you can swap**.
+engine speak different shapes of the same ideas. Integrating them today
+means translators — fragile, per-pair, drifting. GAIP gives them **one
+typed envelope, six universal primitives and transports you can swap**.
 
 It is CORBA's GIOP rebuilt for agents: the parts that made GIOP survive
 production (a closed operation vocabulary, deadline and retry policies,
-references that outlive crashes) without the parts that aged
-(no CDR, no TypeCode/`Any`, no DII).
+references that outlive crashes) without the parts that aged (no CDR,
+no TypeCode/`Any`, no DII).
 
 ## One envelope. Six primitives. Zero translators.
 
@@ -35,30 +35,25 @@ references that outlive crashes) without the parts that aged
 ```
 
 `TASK_REQUEST · TASK_REPLY · TASK_STREAM · CANCEL_REQUEST ·
-CAPABILITY_QUERY · HUMAN_INTERVENT` — that is the whole vocabulary. A
-framework-specific verb is refused **with the word the peer sent**,
-because a protocol that quietly accepts `on_tool_start` is a protocol
-with one translator per framework pair.
+CAPABILITY_QUERY · HUMAN_INTERVENT`
+
+That is the whole vocabulary. A framework-specific verb is refused
+**with the word the peer sent** — a protocol that quietly accepts
+`on_tool_start` is a protocol with one translator per framework pair.
 
 ## What you get
 
-| | |
+| Capability | What it means for you |
 |---|---|
-| **5 transports, one contract** | framed TCP, SSE, TLS 1.3, gRPC/HTTP/2, NATS — payloads never change with the wire |
-| **Exactly-once across restarts** | the broker checkpoints its dedupe window on SIGTERM; a restarted exchange replays identically, no re-execution |
-| **At-least-once, acknowledged** | the broker stamps `DELIVERED` on what it actually handed to a participant; dead letters are journaled with the reason |
-| **References that survive crashes** | an IOR with failover endpoints; a Locate for a dead participant answers `OBJECT_FORWARD` with where it can still be reached |
-| **Discovery that answers questions** | a Naming Service, a Trader with a real constraint language (`capability = "X" AND vram_free_mb > 30000`), and `corbaname:` |
-| **Flow control on the wire** | stream credits per connection; a starved producer reports Timeout instead of racing its reader |
-| **Locks with leases** | CosConcurrency-lite: a crashed holder cannot deadlock anyone |
+| **5 transports, one contract** | TCP, SSE, TLS 1.3, gRPC/HTTP-2, NATS — payloads never change with the wire |
+| **Exactly-once across restarts** | The broker checkpoints its dedupe window on SIGTERM; a restarted exchange replays identically, no re-execution |
+| **Crash-proof references** | An IOR with failover endpoints; a Locate for a dead participant answers `OBJECT_FORWARD` with where it can still be reached |
+| **Rich discovery** | Naming Service + Trader with a real constraint language (`capability = "X" AND vram_free_mb > 30000`) |
+| **Flow control on the wire** | Per-connection stream credits; a starved producer reports Timeout instead of racing its reader |
 | **Signed schema pushes** | IDL updates ride a verified CSIv2 identity — a poisoned declaration is a refusal |
-| **Interceptors** | server- and client-side hooks for tracing, metrics and retry policy |
-| **Backpressure** | bounded outboxes; a stalled peer gets a retryable refusal, never a frozen broker |
-| **Nothing wasted on the hot path** | one serialization per message (decode validates in place); the broker's encode never waits on its global mutex |
-| **A client that does the right thing** | `gaip-client`: failover driving a real socket, event cursor resuming across reconnects, CSIv2 on every call |
-
-**Security**: HMAC identity assertions with roles and delegation (CSIv2),
-TLS 1.3 on every plane, and a signed schema registry.
+| **Backpressure** | Bounded outboxes; a stalled peer gets a retryable refusal, never a frozen broker |
+| **Security** | HMAC identity assertions with roles and delegation (CSIv2), TLS 1.3 on every plane, signed schema registry |
+| **A client that does the right thing** | Failover driving a real socket, event cursor resuming across reconnects, interceptors for tracing and retry |
 
 ## Quickstart
 
@@ -85,120 +80,51 @@ A client is one crate away:
 let mut c = Client::new(vec!["127.0.0.1:7610".into()], 2)
     .with_identity(signed_token)
     .with_interceptor(Arc::new(Recorder::default()));
-let x = c.call(task_request)?;      // fails over if this endpoint dies
+let x = c.call(task_request)?;       // fails over if this endpoint dies
 let (events, gap) = c.pull_events()?; // "what did I miss", cursor-aware
 ```
 
-## Proven, not promised
+## Proven in CI
 
-Every number below is produced by a script in this repo — CI re-runs
-001–006 on every push and the release workflow re-runs the same gate
-before packaging any binary (007, the checkpoint cycle, runs on demand).
+Every claim above is backed by a script in this repo. CI re-runs the
+full gate on every push and before packaging any release binary.
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | 154 tests (unit + hostile input + client integration) |
+| Unit + integration tests | 154 |
 | GIOP layer end-to-end | 28/28 |
 | Federated brokers end-to-end | 9/9 |
-| NATS (real nats-server) | PASS |
-| gRPC (real HTTP/2) | PASS |
 | TLS 1.3 end-to-end | 4/4 |
-| Robustness set (failover, locks, events, stats) | 12/12 |
+| NATS (real nats-server) + gRPC (real HTTP/2) | PASS |
+| Robustness (failover, locks, events, stats) | 12/12 |
 | Checkpoint cycle (restart + replay) | 3/3 |
+
+## Status
+
+| Area | State |
+|---|---|
+| Core protocol, broker, engine, client | **Stable** |
+| TLS, NATS, gRPC bindings | **Stable** |
+| Kafka binding | In progress |
+| GSSAPI/Kerberos | Not planned (HMAC + TLS covers the use case) |
+| Broker peer authentication | Address-trusted (federation peers) |
 
 ## Repository
 
 ```
-gaip-core/      the contract — no IO: envelope, primitives, wire layer,
-                fragments, contexts, IDL+IR, naming/trader, CSIv2, locks,
-                events, failover planning
-gaip-engine/    reference participant: the six primitives, deadlines,
-                callbacks, TLS, interceptors, locks, events
-gaip-broker/    the relay: URN routing, federation, dedupe, checkpoint,
-                failover registry, dead letters
-gaip-client/    the caller half: failover, cursor, interceptors
-gaip-bindings/  NATS, gRPC
-schema/         the contract on disk: envelope JSON-Schema +
-                intents IDL
-experiments/    7 end-to-end proofs
+gaip-core/       the contract (no IO)
+gaip-engine/     reference participant
+gaip-broker/     the relay
+gaip-client/     the caller half
+gaip-bindings/   NATS, gRPC
+schema/          envelope JSON-Schema + intents IDL
+experiments/     7 end-to-end proofs
 ```
-
-## Honest scope
-
-* **Kafka binding** — mapped, not written. A binding is not claimed
-  before it is tested.
-* **GSSAPI/Kerberos** — the token is the HMAC assertion; TLS is the
-  transport half.
-* **Broker authentication** — federation peers are trusted by address.
-* **Exactly-once window** — 4096 entries / 120 s; beyond it a duplicate
-  is a new message. Stated, not implied.
-* **Locks and event channels are engine-local** — they do not span
-  brokers.
 
 ## Version history
 
-| Version | What landed |
-|---|---|
-| **v0.5.9** | performance round 6: the broker's relay path no longer parses a
-  relayed reply's body into an `Envelope` tree just to cache it — the exactly-once
-  bookkeeping stores the body's wire bytes (`remember_raw`) and materializes them
-  only on the rare replay/checkpoint, removing ~1 µs of serde from the hot path per
-  relayed reply; the engine's `InterfaceRepository` is now shared process-wide
-  (one `Arc<RwLock>`) instead of cloned per connection, so a schema sync on any
-  socket is visible to all peers; the broker's routing-loop check scans the route
-  in place (`route_contains`) instead of building a `Vec` per request. Test count
-  153 → 154 |
-| v0.5.8 | reliability + persistence: the client's failover decision is now a
-  typed `TransientNoReply` variant match instead of a string guess on a
-  `BadField` message (a "Broken pipe" on write used to fall through as
-  permanent and never trigger failover); the dedupe cache's lazy eviction
-  no longer strands keys in the FIFO, so the window stays bounded at its
-  declared capacity; the naming table round-trips through JSON
-  (`to_json`/`from_json` re-validates every name and IOR on the way in,
-  so a corrupt file is refused whole); `Trader::query_owned` returns
-  owned offers that can cross a `send` or outlive a lock guard;
-  `Offer::text` mirrors `number` for text attributes. Test count
-  147 → 153 |
-| v0.5.7 | performance round 5: the relay's REPLY leg gets the same treatment
-  as the REQUEST leg — `decode_wire_view` peeks the frame tag from the raw
-  bytes before any serde pass and decodes a REPLY into a routing view whose
-  body stays untouched, and the broker re-frames those same bytes with the
-  hop stamped (`encode_reply_view`) — 1635 ns per relayed reply vs 2589 for
-  the full decode + encode; envelope validation stops paying four String
-  copies per address (`urn::is_valid` walks the bytes once, proven
-  equivalent to `FromStr`) |
-| v0.5.6 | performance round 4: the participant's `decode_wire` REQUEST
-  fast path parses the envelope in ONE streaming pass (raw body span, no
-  intermediate `Value` tree; a missing `payload` is refused, not coerced to
-  `{}`) — 2850 -> 1983 ns per frame; broker fan-out shares one
-  `Arc<[u8]>` across all N target connections, the outbox writes + flushes
-  once per burst, dedupe probes are O(1) (checkpoint replay stays
-  deterministic) and `ContextList` is a linear scan |
-| v0.5.5 | relay without a payload parse: a REQUEST is decoded into a
-  routing view (tag, `request_id`, `contexts`, five envelope fields) with the
-  envelope carried as raw bytes, so the broker never builds a `Value` tree and
-  re-frames the original bytes with the ROUTE context appended. ~1.85x on the
-  relay's hot path (3075 -> 1628 ns per relayed request, `bench_wire`) |
-| v0.5.4 | performance round 3: single-pass framed serialization
-  (`to_writer` straight into the length-prefixed buffer), outbox writer
-  flushing once per batch, fixed task pool (`GAIP_TASK_WORKERS`) replacing
-  thread-per-task, broker routing under a read lock with per-map inner
-  mutexes (dedupe, pending-local, pending-flood) and a side-effect-free
-  dedupe probe |
-| v0.5.3 | performance: cached parsed URN in `Offer`, partial `best()`
-  selection, flat dedupe key (one allocation per lookup) |
-| v0.5.2 | performance round 2: read loops consume by offset (one
-  compaction per read), envelope parse moves the payload, dedupe replies
-  shared by Arc (no clone under the broker lock), compact SSE events,
-  release profile with thin LTO |
-| v0.5.1 | performance: decode validates in place (one serialization
-  per message), IDL validation without cloning the payload, the broker
-  encodes outside its global mutex |
-| v0.5.0 | delivery stamps + dead letters, stream credits, signed schema push, deadline at the edge + negative cache, `gaip-client`, broker checkpoint |
-| v0.4.0 | interceptors, transparent failover, `corbaname:`, locks with leases, event channel with QoS |
-| v0.3.0 | federated broker, schema push, trader query language, NATS + gRPC + TLS bindings, backpressure |
-| v0.2.0 | GIOP wire layer, service contexts, exceptions, IOR/naming/trader, IDL+IR, CSIv2 assertion |
-| v0.1.0 | typed envelope, six primitives, lifecycle, framed TCP + SSE |
+See [GitHub Releases](https://github.com/mrschneider/gaip/releases) for
+the full changelog.
 
 ## License
 
