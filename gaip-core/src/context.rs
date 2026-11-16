@@ -115,7 +115,9 @@ impl ContextList {
     }
 
     /// Sorted by id: the wire form is deterministic regardless of the
-    /// order in which hops stamped the list.
+    /// order in which hops stamped the list. The broker calls this ONCE
+    /// per request and shares the result across every target, so the
+    /// context strings are cloned exactly once per relayed request.
     pub fn to_vec(&self) -> Vec<ServiceContext> {
         let mut v: Vec<ServiceContext> = self
             .entries
@@ -174,6 +176,15 @@ impl ContextList {
         self.get(id::ROUTE)
             .map(|r| r.split(',').filter(|s| !s.is_empty()).collect())
             .unwrap_or_default()
+    }
+
+    /// Is `urn` already a hop in the route? The broker's loop check runs on
+    /// every request; this scans the comma list in place instead of
+    /// building a `Vec<&str>` (one allocation per request) just to call
+    /// `contains`.
+    pub fn route_contains(&self, urn: &str) -> bool {
+        self.get(id::ROUTE)
+            .is_some_and(|r| r.split(',').any(|s| s == urn))
     }
 
     pub fn is_empty(&self) -> bool {

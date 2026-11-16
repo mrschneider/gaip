@@ -234,6 +234,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Shared process-wide: a schema sync on ANY connection must be visible
+    // to all peers (the old code cloned the repo per connection, so a
+    // pushed declaration only landed on the socket that received it).
+    let shared_ir: Arc<std::sync::RwLock<InterfaceRepository>> =
+        Arc::new(std::sync::RwLock::new(ir));
 
     // CSIv2 transport half: TLS around the same protocol. The identity
     // assertion still proves *who*, TLS proves *with whom*.
@@ -271,7 +276,7 @@ fn main() {
     };
     eprintln!(
         "[engine] {name} listening on {host}:{port} ({} intents, fragment {fragment_size} B)",
-        ir.len()
+        shared_ir.read().unwrap().len()
     );
 
     // STATUS SURFACE: the recorder is process-wide (shared across peer
@@ -338,7 +343,7 @@ fn main() {
         let peer = Arc::new(Peer {
             urn: name.clone(),
             out,
-            ir: Arc::new(std::sync::RwLock::new(ir.clone())),
+            ir: shared_ir.clone(),
             creds: Arc::new(Credentials::new(key.clone().into_bytes())),
             policies,
             fragments: Mutex::new(BTreeMap::new()),

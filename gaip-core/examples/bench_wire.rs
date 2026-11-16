@@ -104,6 +104,21 @@ fn main() {
             let _ = encode_reply_view(rep.request_id, &ReplyStatus::NoException, &[hop], rep.body);
         }
     });
+    // The exactly-once bookkeeping that rides the reply leg. OLD: parse the
+    // body into an Envelope tree to cache it. NEW: store the body's wire
+    // bytes as a String (remember_raw) — no tree is built on the hot path.
+    let (rframe, _) = decode_wire_view(&reply_bytes).unwrap().unwrap();
+    if let WireFrame::Reply(rep) = rframe {
+        if let Some(raw) = rep.body {
+            let raw_str = raw.get();
+            bench("dedupe: parse body (old)", iters, || {
+                let _ = serde_json::from_str::<Envelope>(raw_str);
+            });
+            bench("dedupe: store raw (new)", iters, || {
+                let _ = raw_str.to_string();
+            });
+        }
+    }
     let body = serde_json::to_vec(&msg).unwrap();
     bench("to_vec+encode_body", iters, || {
         let b = serde_json::to_vec(&msg).unwrap();

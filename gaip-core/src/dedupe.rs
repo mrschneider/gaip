@@ -10,6 +10,7 @@
 //! and returns the reply it already produced, so a retry answers
 //! identically instead of running the work again.
 
+use crate::envelope::Envelope;
 use crate::message::{ReplyStatus, WireMessage};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -20,6 +21,41 @@ use std::time::{Duration, Instant};
 pub struct Remembered {
     pub reply: Arc<WireMessage>,
     pub stored_at: Instant,
+    /// The reply body's envelope bytes exactly as they arrived on the wire,
+    /// kept so a relay can remember an exchange it is FAN-OUT without
+    /// parsing the body into a `Value` tree (a ~1 µs serde pass per relayed
+    /// reply). `None` for bodyless (exception) replies and for entries that
+    /// predate this field (a restored row simply re-parses once).
+    pub body_raw: Option<String>,
+}
+
+impl Remembered {
+    /// The reply with its body materialized. A raw entry (stored by a relay
+    /// via `remember_raw`) parses the body HERE — on the rare replay — so
+    /// the hot `remember` path never builds a tree. A parsed entry is
+    /// returned as-is.
+    fn materialized(&self) -> WireMessage {
+        let m = self.reply.as_ref().clone();
+        if let Some(raw) = &self.body_raw {
+            if let Ok(env) = serde_json::from_str::<Envelope>(raw) {
+                return match m {
+                    WireMessage::Reply {
+                        request_id,
+                        status,
+                        contexts,
+                        ..
+                    } => WireMessage::Reply {
+                        request_id,
+                        status,
+                        body: Some(env),
+                        contexts,
+                    },
+                    other => other,
+                };
+            }
+        }
+        m
+    }
 }
 
 /// A bounded, TTL'd cache of completed requests.
@@ -74,7 +110,7 @@ impl DedupeCache {
         match self.entries.get(&key) {
             Some(r) if now.duration_since(r.stored_at) <= self.ttl => {
                 self.hits += 1;
-                Some(r.reply.as_ref().clone())
+                Some(r.materialized())
             }
             Some(_) => {
                 // Drop it from BOTH maps. Leaving the key in `order` would
@@ -104,7 +140,7 @@ impl DedupeCache {
         self.entries
             .get(&key)
             .filter(|r| now.duration_since(r.stored_at) <= self.ttl)
-            .map(|r| r.reply.as_ref().clone())
+            .map(|r| r.materialized())
     }
 
     /// Remember the reply for a completed request. Evicts the oldest
@@ -112,6 +148,33 @@ impl DedupeCache {
     /// window, and pretending otherwise would be a lie.
     pub fn remember(&mut self, sender: &str, message_id: &str, reply: impl Into<Arc<WireMessage>>) {
         let reply = reply.into();
+        self.insert(sender, message_id, reply, None);
+    }
+
+    /// Remember a relayed reply WITHOUT parsing its body. The broker's
+    /// relay path already has the body as wire bytes (`&RawValue`); the
+    /// old code parsed those bytes into an `Envelope` (a full serde pass,
+    /// ~1 µs) just to cache it, and re-serialized it again on the rare
+    /// replay. Here the raw bytes are stored as-is and spliced back on
+    /// replay via `encode_reply_view` — no tree is ever built.
+    pub fn remember_raw(
+        &mut self,
+        sender: &str,
+        message_id: &str,
+        reply: impl Into<Arc<WireMessage>>,
+        body_raw: Option<String>,
+    ) {
+        let reply = reply.into();
+        self.insert(sender, message_id, reply, body_raw);
+    }
+
+    fn insert(
+        &mut self,
+        sender: &str,
+        message_id: &str,
+        reply: Arc<WireMessage>,
+        body_raw: Option<String>,
+    ) {
         let key = Self::key(sender, message_id);
         // Evict until there is a real free slot. `order` can hold keys
         // that are no longer in `entries` (an expired entry reclaimed by a
@@ -131,6 +194,7 @@ impl DedupeCache {
             Remembered {
                 reply,
                 stored_at: Instant::now(),
+                body_raw,
             },
         );
     }
@@ -174,11 +238,14 @@ impl DedupeCache {
                     return None;
                 }
                 let (sender, msg_id) = Self::split_key(k);
+                // Materialize the body: a relay entry is stored with the body
+                // as raw bytes and `body: None`, so a checkpoint must capture
+                // the full reply or a restart would replay a bodyless reply.
                 Some((
                     sender.to_string(),
                     msg_id.to_string(),
                     left_ms,
-                    r.reply.clone(),
+                    Arc::new(r.materialized()),
                 ))
             })
             .collect();
@@ -209,6 +276,9 @@ impl DedupeCache {
                             (self.ttl.as_millis().saturating_sub(left_ms)) as u64,
                         ))
                         .unwrap_or(now),
+                    // Restored rows carry no raw body: a replay of such a
+                    // row re-parses the owned Envelope once (the old path).
+                    body_raw: None,
                 },
             );
             self.order.push_back(key);
@@ -332,6 +402,45 @@ mod tests {
                 );
             }
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_raw_entry_materializes_its_body_on_replay_and_checkpoint() {
+        let mut c = DedupeCache::new(8, Duration::from_secs(60));
+        let env = Envelope::task_request(
+            "msg_1",
+            "task_1",
+            "urn:agent:rust:tokio:engine",
+            "urn:agent:python:langgraph:planner",
+            json!({"n": "raw"}),
+        );
+        let raw = env.to_json();
+        // stored the way the broker stores a relayed reply: body bytes only
+        c.remember_raw(
+            "urn:agent:a",
+            "msg_1",
+            WireMessage::Reply {
+                request_id: 1,
+                status: ReplyStatus::NoException,
+                body: None,
+                contexts: Vec::new(),
+            },
+            Some(raw),
+        );
+        // replay materializes the body from the raw bytes
+        match c.lookup("urn:agent:a", "msg_1").expect("must replay") {
+            WireMessage::Reply { body: Some(b), .. } => assert_eq!(b.payload, json!({"n": "raw"})),
+            other => panic!("raw entry must replay with a body, got {other:?}"),
+        }
+        // a checkpoint captures the full reply, not a bodyless stub
+        let rows = c.snapshot(Instant::now());
+        assert_eq!(rows.len(), 1);
+        match rows[0].3.as_ref() {
+            WireMessage::Reply { body: Some(b), .. } => {
+                assert_eq!(b.payload, json!({"n": "raw"}))
+            }
+            other => panic!("checkpoint must carry the body, got {other:?}"),
         }
     }
 }

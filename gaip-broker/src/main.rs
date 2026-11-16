@@ -511,7 +511,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
     let decision = {
         let b = shared.read().unwrap();
         let own = b.urn.clone();
-        if ctx.route().contains(&own.as_str()) {
+        if ctx.route_contains(&own) {
             Decision::Loop(WireMessage::Reply {
                 request_id,
                 status: ReplyStatus::system(
@@ -767,25 +767,24 @@ fn handle_reply_view(
         }
         // exactly-once: remember the reply against the request that caused
         // it, using the (connection, request_id) the broker handed out.
-        // The dedupe cache stores an owned `WireMessage` (replayed on
-        // retry), so the body is materialized once — the forwarded bytes
-        // below stay the originals.
+        // The body is stored as its WIRE BYTES (`remember_raw`), not parsed
+        // into an `Envelope` tree — the old code paid a full serde pass here
+        // for EVERY relayed reply just to cache it, then re-serialized it
+        // again on the rare replay. The raw bytes are spliced back on
+        // replay via `encode_reply_view`; the forwarded bytes below stay the
+        // originals.
         if let Some((sender, msg_id)) = pending {
-            let body = reply
-                .body
-                .map(|raw| serde_json::from_str::<gaip_core::envelope::Envelope>(raw.get()))
-                .transpose()
-                .ok()
-                .flatten();
-            b.dedupe.lock().unwrap().remember(
+            let body_raw = reply.body.map(|raw| raw.get().to_string());
+            b.dedupe.lock().unwrap().remember_raw(
                 &sender,
                 &msg_id,
                 WireMessage::Reply {
                     request_id: reply.request_id,
                     status: reply.status.clone(),
-                    body,
+                    body: None, // carried as raw bytes; materialized on replay
                     contexts: stamped.clone(),
                 },
+                body_raw,
             );
         }
         // a reply travels to the envelope's recipient: a bodyless reply
