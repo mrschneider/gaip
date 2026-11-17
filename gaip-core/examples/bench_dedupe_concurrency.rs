@@ -5,11 +5,10 @@
 use gaip_core::dedupe::DedupeCache;
 use gaip_core::envelope::Envelope;
 use gaip_core::message::{ReplyStatus, WireMessage};
-use gaip_core::ServiceContext;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -26,7 +25,10 @@ fn reply_body() -> String {
 }
 
 fn main() {
-    let threads = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let threads = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     let per_thread: u64 = 200_000;
 
     // Single-thread baseline.
@@ -37,22 +39,35 @@ fn main() {
         for i in 0..per_thread {
             let sender = format!("urn:agent:{}", i % 1000);
             let msg_id = format!("msg_{i}");
-            c.remember_raw(&sender, &msg_id, WireMessage::Reply {
-                request_id: 1,
-                status: ReplyStatus::NoException,
-                body: None,
-                contexts: vec![],
-            }, Some(body.clone()));
+            c.remember_raw(
+                &sender,
+                &msg_id,
+                WireMessage::Reply {
+                    request_id: 1,
+                    status: ReplyStatus::NoException,
+                    body: None,
+                    contexts: vec![],
+                },
+                Some(body.clone()),
+            );
             let _ = c.lookup_read(&sender, &msg_id);
         }
         let ns = start.elapsed().as_nanos() as f64 / per_thread as f64;
-        println!("[single-thread] {per_thread} ops: {ns:.1} ns/op ({:.2} M/s)", 1e9 / ns / 1e6);
+        println!(
+            "[single-thread] {per_thread} ops: {ns:.1} ns/op ({:.2} M/s)",
+            1e9 / ns / 1e6
+        );
     }
 
     // Multi-threaded: many workers on ONE shared cache (the broker's real shape).
     for n in [1u32, 2, 4, 8, 16] {
-        if n > threads { break; }
-        let cache = Arc::new(std::sync::Mutex::new(DedupeCache::new(1 << 20, std::time::Duration::from_secs(120))));
+        if n > threads {
+            break;
+        }
+        let cache = Arc::new(std::sync::Mutex::new(DedupeCache::new(
+            1 << 20,
+            std::time::Duration::from_secs(120),
+        )));
         let counter = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::channel();
         let start = Instant::now();
@@ -67,12 +82,17 @@ fn main() {
                 for i in 0..per_thread {
                     let sender = format!("urn:agent:{}:{}", t, i % 500);
                     let msg_id = format!("msg_{t}_{i}");
-                    cache.lock().unwrap().remember_raw(&sender, &msg_id, WireMessage::Reply {
-                        request_id: 1,
-                        status: ReplyStatus::NoException,
-                        body: None,
-                        contexts: vec![],
-                    }, Some(body.clone()));
+                    cache.lock().unwrap().remember_raw(
+                        &sender,
+                        &msg_id,
+                        WireMessage::Reply {
+                            request_id: 1,
+                            status: ReplyStatus::NoException,
+                            body: None,
+                            contexts: vec![],
+                        },
+                        Some(body.clone()),
+                    );
                     let _ = cache.lock().unwrap().lookup_read(&sender, &msg_id);
                     local += 1;
                 }
@@ -82,9 +102,16 @@ fn main() {
         }
         drop(tx);
         let mut total = 0;
-        for _ in 0..n { total += rx.recv().unwrap(); }
-        for h in handles { h.join().unwrap(); }
+        for _ in 0..n {
+            total += rx.recv().unwrap();
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
         let ns = start.elapsed().as_nanos() as f64 / total as f64;
-        println!("[{n:2} threads] {total} ops: {ns:.1} ns/op ({:.2} M/s)", 1e9 / ns / 1e6);
+        println!(
+            "[{n:2} threads] {total} ops: {ns:.1} ns/op ({:.2} M/s)",
+            1e9 / ns / 1e6
+        );
     }
 }
