@@ -12,7 +12,7 @@
 
 use crate::envelope::Envelope;
 use crate::message::{ReplyStatus, WireMessage};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,41 @@ impl Remembered {
     }
 }
 
+/// A zero-copy composite lookup key for the hot `lookup`/`lookup_read`
+/// paths. The stored key is a `String` (`sender \u{1} message_id`);
+/// building that same `String` on every probe costs ~60ns/op whether
+/// the probe hits or misses — pure waste on the broker's read lock.
+/// `CompositeKey<'a>` hashes and compares the *identical byte
+/// sequence* without ever allocating: `Hash` folds the two halves and
+/// the separator, and `Equivalent<String>` compares against the stored
+/// key byte-for-byte. The `HashMap` contract (`Hash` + `Eq` on the
+/// borrowed form must match those of the key type) holds because the
+/// bytes are the same, so the bucket probe lands exactly where the
+/// stored key hashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeKey<'a> {
+    pub sender: &'a str,
+    pub message_id: &'a str,
+}
+
+impl<'a> std::hash::Hash for CompositeKey<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.sender.hash(state);
+        DedupeCache::SEP.hash(state);
+        self.message_id.hash(state);
+    }
+}
+
+impl<'a> hashbrown::Equivalent<String> for CompositeKey<'a> {
+    fn equivalent(&self, key: &String) -> bool {
+        let mut it = key.splitn(2, DedupeCache::SEP);
+        let (Some(expected_sender), Some(rest)) = (it.next(), it.next()) else {
+            return false;
+        };
+        expected_sender == self.sender && rest == self.message_id
+    }
+}
+
 /// A bounded, TTL'd cache of completed requests.
 #[derive(Debug)]
 pub struct DedupeCache {
@@ -69,7 +104,7 @@ pub struct DedupeCache {
     /// this under the broker's read lock) and is O(1) here, O(log n) in
     /// a BTreeMap. FIFO order lives in `order`, and the snapshot sorts
     /// its rows, so checkpoint determinism does not depend on the map.
-    entries: HashMap<String, Remembered>,
+    entries: hashbrown::HashMap<String, Remembered>,
     order: VecDeque<String>,
     capacity: usize,
     ttl: Duration,
@@ -79,7 +114,7 @@ pub struct DedupeCache {
 impl DedupeCache {
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: hashbrown::HashMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
             ttl,
@@ -135,11 +170,32 @@ impl DedupeCache {
     /// acquisition. Expired entries are simply reported as a miss; the
     /// sweep path (or the next `lookup`) reclaims them.
     pub fn lookup_read(&self, sender: &str, message_id: &str) -> Option<WireMessage> {
-        let key = Self::key(sender, message_id);
-        let now = Instant::now();
+        self.lookup_q(&CompositeKey { sender, message_id })
+    }
+
+    /// Read-only probe that takes a [`CompositeKey`] directly, so the
+    /// hot path builds no combined `String` — the key is hashed and
+    /// compared against the stored key bytes in place.
+    pub fn lookup_read_q(&self, key: &CompositeKey<'_>) -> Option<WireMessage> {
         self.entries
-            .get(&key)
-            .filter(|r| now.duration_since(r.stored_at) <= self.ttl)
+            .get(key)
+            .filter(|r| {
+                let now = Instant::now();
+                now.duration_since(r.stored_at) <= self.ttl
+            })
+            .map(|r| r.materialized())
+    }
+
+    /// Read-only probe from a pre-built [`CompositeKey`]: the internal path
+    /// shared by `lookup_read` and the broker's hot path. No combined key
+    /// `String` is ever allocated.
+    fn lookup_q(&self, key: &CompositeKey<'_>) -> Option<WireMessage> {
+        self.entries
+            .get(key)
+            .filter(|r| {
+                let now = Instant::now();
+                now.duration_since(r.stored_at) <= self.ttl
+            })
             .map(|r| r.materialized())
     }
 

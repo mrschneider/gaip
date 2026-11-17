@@ -532,7 +532,10 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                 .dedupe
                 .lock()
                 .unwrap()
-                .lookup_read(&req.sender, &req.message_id);
+                .lookup_read_q(&gaip_core::dedupe::CompositeKey {
+                    sender: &req.sender,
+                    message_id: &req.message_id,
+                });
             if let Some(WireMessage::Reply { status, body, .. }) = cached {
                 Decision::Replay(WireMessage::Reply {
                     request_id,
