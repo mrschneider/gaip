@@ -77,9 +77,19 @@ pub struct CompositeKey<'a> {
 
 impl<'a> std::hash::Hash for CompositeKey<'a> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.sender.hash(state);
-        DedupeCache::SEP.hash(state);
-        self.message_id.hash(state);
+        // The stored key is the flat string `sender SEP message_id`, and the
+        // map probes that key with `str::hash`. `str::hash` delegates the
+        // bytes to `Hasher::write`, whose default impl is opaque per hasher
+        // (DefaultHasher is SipHasher, which folds bytes in chunks) — so no
+        // byte-by-byte fold of the two halves and the separator can reproduce
+        // it and would land in a different bucket, an always-miss that
+        // silently breaks the exactly-once effect. The only way the probe
+        // lands exactly where the stored key was inserted is to hash the
+        // *identical* string the same way: build the flat key and let its
+        // `str::Hash` drive the hasher. The `Equivalent` byte-compare below
+        // then confirms it is the same key.
+        let flat = format!("{}{}{}", self.sender, DedupeCache::SEP, self.message_id);
+        flat.hash(state);
     }
 }
 
