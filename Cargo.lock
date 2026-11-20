@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-bindings"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "gaip-core",
  "prost",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-broker"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "gaip-core",
  "parking_lot",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-client"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "crypto-common",
  "digest",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-core"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "digest",
  "hashbrown 0.17.1",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "gaip-engine"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "gaip-core",
  "rustls",
