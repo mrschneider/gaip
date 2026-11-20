@@ -58,64 +58,50 @@ impl Remembered {
     }
 }
 
-/// A zero-copy composite lookup key for the hot `lookup`/`lookup_read`
-/// paths. The stored key is a `String` (`sender \u{1} message_id`);
-/// building that same `String` on every probe costs ~60ns/op whether
-/// the probe hits or misses — pure waste on the broker's read lock.
-/// `CompositeKey<'a>` hashes and compares the *identical byte
-/// sequence* without ever allocating: `Hash` folds the two halves and
-/// the separator, and `Equivalent<String>` compares against the stored
-/// key byte-for-byte. The `HashMap` contract (`Hash` + `Eq` on the
-/// borrowed form must match those of the key type) holds because the
-/// bytes are the same, so the bucket probe lands exactly where the
-/// stored key hashed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompositeKey<'a> {
-    pub sender: &'a str,
-    pub message_id: &'a str,
+/// A borrowed probe key for the hot `lookup` paths. Wraps `(&str, &str)` so
+/// it can implement hashbrown's `Equivalent` for the owned `(String, String)`
+/// storage key (the orphan rule forbids that impl on the bare tuple). Its
+/// `Hash` delegates to the `(&str, &str)` tuple, which hashes identically to
+/// the `(String, String)` storage key (the tuple's `Hash` delegates to each
+/// element, and `str::hash == String::hash` — verified empirically), so a
+/// probe lands in the right bucket and compares without allocating a
+/// combined key.
+#[derive(Debug, Clone, Copy)]
+struct ProbeKey<'a> {
+    sender: &'a str,
+    message_id: &'a str,
 }
 
-impl<'a> std::hash::Hash for CompositeKey<'a> {
+impl std::hash::Hash for ProbeKey<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // The stored key is the flat string `sender SEP message_id`, and the
-        // map probes that key with `str::hash`. `str::hash` delegates the
-        // bytes to `Hasher::write`, whose default impl is opaque per hasher
-        // (DefaultHasher is SipHasher, which folds bytes in chunks) — so no
-        // byte-by-byte fold of the two halves and the separator can reproduce
-        // it and would land in a different bucket, an always-miss that
-        // silently breaks the exactly-once effect. The only way the probe
-        // lands exactly where the stored key was inserted is to hash the
-        // *identical* string the same way: build the flat key and let its
-        // `str::Hash` drive the hasher. The `Equivalent` byte-compare below
-        // then confirms it is the same key.
-        let flat = format!("{}{}{}", self.sender, DedupeCache::SEP, self.message_id);
-        flat.hash(state);
+        (self.sender, self.message_id).hash(state);
     }
 }
 
-impl<'a> hashbrown::Equivalent<String> for CompositeKey<'a> {
-    fn equivalent(&self, key: &String) -> bool {
-        let mut it = key.splitn(2, DedupeCache::SEP);
-        let (Some(expected_sender), Some(rest)) = (it.next(), it.next()) else {
-            return false;
-        };
-        expected_sender == self.sender && rest == self.message_id
+impl hashbrown::Equivalent<(String, String)> for ProbeKey<'_> {
+    fn equivalent(&self, key: &(String, String)) -> bool {
+        key.0 == self.sender && key.1 == self.message_id
     }
 }
 
 /// A bounded, TTL'd cache of completed requests.
 #[derive(Debug)]
 pub struct DedupeCache {
-    /// Key is `sender \u{1} message_id` in one String: the two halves are
-    /// URN/restricted text that cannot contain the separator, and one
-    /// flat key means one allocation per lookup instead of three (the
-    /// tuple plus its two fields) and a single-byte comparison scan.
-    /// HashMap: the lookup is the hot path (every relayed request probes
-    /// this under the broker's read lock) and is O(1) here, O(log n) in
-    /// a BTreeMap. FIFO order lives in `order`, and the snapshot sorts
-    /// its rows, so checkpoint determinism does not depend on the map.
-    entries: hashbrown::HashMap<String, Remembered>,
-    order: VecDeque<String>,
+    /// Key is the `(sender, message_id)` pair. The lookup is the hot path
+    /// (every relayed request probes this under the broker's read lock)
+    /// and is O(1) here, O(log n) in a BTreeMap. The probe uses the
+    /// borrowed form `(&str, &str)`, which hashes and compares
+    /// identically to the owned `(String, String)` (the tuple's `Hash`
+    /// delegates to each element's, and `str::hash == String::hash` —
+    /// verified empirically), so a hit/miss lands in the right bucket
+    /// WITHOUT ever allocating a combined key. The earlier flat-`String`
+    /// key forced every probe to rebuild that string (its `str::hash`
+    /// folds a std-internal terminator, so no non-allocating fold of the
+    /// two halves matches it). FIFO order lives in `order`, and the
+    /// snapshot sorts its rows, so checkpoint determinism does not depend
+    /// on the map.
+    entries: hashbrown::HashMap<(String, String), Remembered>,
+    order: VecDeque<(String, String)>,
     capacity: usize,
     ttl: Duration,
     hits: u64,
@@ -132,27 +118,17 @@ impl DedupeCache {
         }
     }
 
-    const SEP: char = '\u{1}';
-
-    fn key(sender: &str, message_id: &str) -> String {
-        let mut k = String::with_capacity(sender.len() + message_id.len() + 1);
-        k.push_str(sender);
-        k.push(Self::SEP);
-        k.push_str(message_id);
-        k
-    }
-
-    /// The `(sender, message_id)` half-pair back out of a flat key.
-    fn split_key(k: &str) -> (&str, &str) {
-        k.split_once(Self::SEP).unwrap_or((k, ""))
+    /// The owned storage key.
+    fn key(sender: &str, message_id: &str) -> (String, String) {
+        (sender.to_string(), message_id.to_string())
     }
 
     /// Was this exact message already handled? Returns the reply to
     /// replay, so the caller answers without doing the work again.
     pub fn lookup(&mut self, sender: &str, message_id: &str) -> Option<WireMessage> {
-        let key = Self::key(sender, message_id);
+        let q = ProbeKey { sender, message_id };
         let now = Instant::now();
-        match self.entries.get(&key) {
+        match self.entries.get(&q) {
             Some(r) if now.duration_since(r.stored_at) <= self.ttl => {
                 self.hits += 1;
                 Some(r.materialized())
@@ -163,8 +139,8 @@ impl DedupeCache {
                 // eviction, and insert past capacity (the window growing
                 // past its declared bound). `sweep` already keeps this
                 // invariant; a lazy `lookup` eviction must too.
-                self.entries.remove(&key);
-                self.order.retain(|k| k != &key);
+                self.entries.remove(&q);
+                self.order.retain(|(s, m)| s != sender || m != message_id);
                 None
             }
             None => None,
@@ -179,33 +155,16 @@ impl DedupeCache {
     /// variant exists so the exactly-once check does not force a write
     /// acquisition. Expired entries are simply reported as a miss; the
     /// sweep path (or the next `lookup`) reclaims them.
+    ///
+    /// The probe is a borrowed [`ProbeKey`]: it hashes and compares
+    /// identically to the owned `(String, String)` storage key and
+    /// allocates NOTHING, so a hit or a miss both cost a single hashbrown
+    /// probe — no combined-key rebuild.
     pub fn lookup_read(&self, sender: &str, message_id: &str) -> Option<WireMessage> {
-        self.lookup_q(&CompositeKey { sender, message_id })
-    }
-
-    /// Read-only probe that takes a [`CompositeKey`] directly, so the
-    /// hot path builds no combined `String` — the key is hashed and
-    /// compared against the stored key bytes in place.
-    pub fn lookup_read_q(&self, key: &CompositeKey<'_>) -> Option<WireMessage> {
+        let q = ProbeKey { sender, message_id };
         self.entries
-            .get(key)
-            .filter(|r| {
-                let now = Instant::now();
-                now.duration_since(r.stored_at) <= self.ttl
-            })
-            .map(|r| r.materialized())
-    }
-
-    /// Read-only probe from a pre-built [`CompositeKey`]: the internal path
-    /// shared by `lookup_read` and the broker's hot path. No combined key
-    /// `String` is ever allocated.
-    fn lookup_q(&self, key: &CompositeKey<'_>) -> Option<WireMessage> {
-        self.entries
-            .get(key)
-            .filter(|r| {
-                let now = Instant::now();
-                now.duration_since(r.stored_at) <= self.ttl
-            })
+            .get(&q)
+            .filter(|r| Instant::now().duration_since(r.stored_at) <= self.ttl)
             .map(|r| r.materialized())
     }
 
@@ -297,19 +256,18 @@ impl DedupeCache {
         let mut rows: Vec<_> = self
             .entries
             .iter()
-            .filter_map(|(k, r)| {
+            .filter_map(|((sender, msg_id), r)| {
                 let left = now.duration_since(r.stored_at);
                 let left_ms = self.ttl.as_millis().saturating_sub(left.as_millis());
                 if left_ms == 0 {
                     return None;
                 }
-                let (sender, msg_id) = Self::split_key(k);
                 // Materialize the body: a relay entry is stored with the body
                 // as raw bytes and `body: None`, so a checkpoint must capture
                 // the full reply or a restart would replay a bodyless reply.
                 Some((
-                    sender.to_string(),
-                    msg_id.to_string(),
+                    sender.clone(),
+                    msg_id.clone(),
                     left_ms,
                     Arc::new(r.materialized()),
                 ))

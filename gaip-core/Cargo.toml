@@ -13,8 +13,11 @@ serde_json = { workspace = true }
 digest = "0.11"
 hmac = { workspace = true }
 sha2 = { workspace = true }
-# std::HashMap is backed by hashbrown; its `Equivalent` trait (used by
-# `HashMap::get`) is the trait `CompositeKey` must implement for the
-# zero-copy hot-path lookup. Added as a direct dep so the impl path is
-# explicit instead of reaching for a std-internal trait.
+# hashbrown backs the dedupe cache's map; its `Equivalent` trait is what
+# the borrowed `ProbeKey` lookup probe implements so a hot-path probe can
+# hit the owned `(String, String)` key without allocating a combined key.
 hashbrown = "0.17"
+
+[dev-dependencies]
+# Used only by the concurrency benchmark examples to measure the lock swap.
+parking_lot = { workspace = true }

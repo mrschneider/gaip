@@ -18,6 +18,11 @@ sha2 = "0.11"
 rustls = "0.23"
 signal-hook = "0.4"
 rustls-pemfile = "2"
+# parking_lot: lock-free fast path + adaptive spinning for the broker's
+# global RwLock/Mutex. Under many concurrent connections the uncontended
+# case dominates, where std's futex-based locks pay a syscall round-trip
+# that parking_lot's atomic spin avoids.
+parking_lot = "0.12"
 
 # Release binaries ship from CI on every tag: thin LTO crosses the
 # crate boundary (core -> engine/broker/client) without the full-link cost,

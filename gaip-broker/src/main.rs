@@ -32,12 +32,13 @@ use gaip_core::envelope::Envelope;
 use gaip_core::error::GaipError;
 use gaip_core::flow::{FlowError, Outbox};
 use gaip_core::message::{ReplyStatus, SystemMinor, WireMessage};
+use parking_lot::{Mutex, RwLock};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One peer on the other side of a connection (participant or broker).
@@ -63,10 +64,13 @@ struct Broker {
     local: BTreeMap<String, Arc<Conn>>,
     /// peer brokers (their connections are entries in `local` too)
     peers: Vec<Arc<Conn>>,
-    /// exactly-once window behind its own Mutex so the routing decision
-    /// (which runs under the broker's READ lock) never needs a write
-    /// acquisition on the broker itself.
-    dedupe: Mutex<DedupeCache>,
+    /// exactly-once window. A `RwLock`, not a `Mutex`: the hot path is a
+    /// READ-ONLY probe (`lookup_read`) on every relayed request, and only a
+    /// completed reply writes. A `Mutex` serialized even the probes under
+    /// load; the `RwLock` lets concurrent probes run in parallel and only
+    /// the rare store takes the write. `parking_lot` for the lock-free
+    /// fast path.
+    dedupe: RwLock<DedupeCache>,
     /// forwarded LOCAL request -> (sender, message_id): the reply that
     /// comes back is remembered for exactly-once replay. Hot path.
     pending_local: Mutex<PendingMap>,
@@ -137,7 +141,7 @@ fn resolve_targets(
     message_id: &str,
 ) -> Vec<Arc<Conn>> {
     if let Some(c) = b.conn_for(target) {
-        b.pending_local.lock().unwrap().insert(
+        b.pending_local.lock().insert(
             (c.id, request_id),
             (sender.to_string(), message_id.to_string()),
         );
@@ -145,7 +149,7 @@ fn resolve_targets(
     }
     let used = b.peer_conns();
     if !used.is_empty() {
-        let mut pf = b.pending_flood.lock().unwrap();
+        let mut pf = b.pending_flood.lock();
         for c in &used {
             pf.insert(
                 (c.id, request_id),
@@ -214,7 +218,7 @@ fn main() {
         urn,
         local: BTreeMap::new(),
         peers: Vec::new(),
-        dedupe: Mutex::new(DedupeCache::new(4096, Duration::from_secs(120))),
+        dedupe: RwLock::new(DedupeCache::new(4096, Duration::from_secs(120))),
         pending_local: Mutex::new(BTreeMap::new()),
         pending_flood: Mutex::new(BTreeMap::new()),
         dead_ends: BTreeMap::new(),
@@ -231,11 +235,11 @@ fn main() {
     // loading only --registry forgets every completed exchange and turns
     // exactly-once into at-least-once across the restart
     if let Some(path) = &state_path {
-        broker.write().unwrap().load_registry(path);
+        broker.write().load_registry(path);
         eprintln!("[broker] state loaded from {}", path.display());
     }
     if let Some(path) = &registry_path {
-        broker.write().unwrap().load_registry(path);
+        broker.write().load_registry(path);
         eprintln!("[broker] registry loaded from {}", path.display());
     }
     // GRACEFUL SHUTDOWN: SIGTERM/SIGINT set the drain flag and checkpoint
@@ -253,10 +257,9 @@ fn main() {
             }
             eprintln!("[broker] signal received: draining");
             b.write()
-                .unwrap()
                 .draining
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            b.read().unwrap().checkpoint();
+            b.read().checkpoint();
             // the accept loop cannot be interrupted out of `incoming()`;
             // the checkpoint is written, so exiting here is the clean cut
             std::process::exit(0);
@@ -286,7 +289,7 @@ fn main() {
         }
         match connected {
             Some((conn, _s, reader)) => {
-                broker.write().unwrap().peers.push(conn.clone());
+                broker.write().peers.push(conn.clone());
                 // a peer's traffic (replies, locate answers) is handled
                 // exactly like any other connection
                 let b2 = broker.clone();
@@ -301,7 +304,6 @@ fn main() {
         .take_while(|_| {
             !broker
                 .read()
-                .unwrap()
                 .draining
                 .load(std::sync::atomic::Ordering::SeqCst)
         })
@@ -405,9 +407,9 @@ fn serve(shared: Arc<RwLock<Broker>>, conn: Arc<Conn>, mut stream: TcpStream) {
             }
         }
     }
-    let name = conn.urn.lock().unwrap().clone();
+    let name = conn.urn.lock().clone();
     if let Some(n) = name {
-        shared.write().unwrap().local.remove(&n);
+        shared.write().local.remove(&n);
         eprintln!("[broker] {n} disconnected");
     }
 }
@@ -463,13 +465,13 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
     let request_id = req.request_id;
     let contexts = req.contexts;
     // register the participant by the URN it uses
-    let registered_new = conn.urn.lock().unwrap().is_none();
+    let registered_new = conn.urn.lock().is_none();
     if registered_new {
-        *conn.urn.lock().unwrap() = Some(req.sender.clone());
+        *conn.urn.lock() = Some(req.sender.clone());
     }
     let mut ctx = ContextList::from_vec(contexts);
     if registered_new {
-        let mut b = shared.write().unwrap();
+        let mut b = shared.write();
         b.local.insert(req.sender.clone(), conn.clone());
         // FAILOVER context: the participant advertises where else
         // it can be reached; the reference outlives the socket
@@ -509,7 +511,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
         },
     }
     let decision = {
-        let b = shared.read().unwrap();
+        let b = shared.read();
         let own = b.urn.clone();
         if ctx.route_contains(&own) {
             Decision::Loop(WireMessage::Reply {
@@ -525,17 +527,10 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
             ctx.push_route(&own);
             // exactly-once effect: replay the reply of a completed
             // exchange. The probe runs FIRST, into a local, so the
-            // MutexGuard is released before the else-chain: a guard
+            // lock guard is released before the else-chain: a guard
             // held across an `if let` scrutinee would deadlock the
-            // `remember` calls below (std Mutex is not reentrant).
-            let cached = b
-                .dedupe
-                .lock()
-                .unwrap()
-                .lookup_read_q(&gaip_core::dedupe::CompositeKey {
-                    sender: &req.sender,
-                    message_id: &req.message_id,
-                });
+            // `remember` calls below (a parking_lot Mutex is not reentrant).
+            let cached = b.dedupe.read().lookup_read(&req.sender, &req.message_id);
             if let Some(WireMessage::Reply { status, body, .. }) = cached {
                 Decision::Replay(WireMessage::Reply {
                     request_id,
@@ -559,8 +554,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                         contexts: Vec::new(),
                     });
                     b.dedupe
-                        .lock()
-                        .unwrap()
+                        .write()
                         .remember(&req.sender, &req.message_id, reply.clone());
                     Decision::Expired(WireMessage::Reply {
                         request_id,
@@ -601,11 +595,9 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                         "{target} was recently unreachable; retry after the negative-cache window"
                     ),
                 );
-                b.dedupe.lock().unwrap().remember_failure(
-                    &req.sender,
-                    &req.message_id,
-                    refusal.clone(),
-                );
+                b.dedupe
+                    .write()
+                    .remember_failure(&req.sender, &req.message_id, refusal.clone());
                 Decision::Refusal(WireMessage::Reply {
                     request_id,
                     status: refusal,
@@ -660,7 +652,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                 for attempt in 0..retries {
                     std::thread::sleep(Duration::from_millis(backoff * (attempt as u64 + 1)));
                     let conns = {
-                        let b = shared.read().unwrap();
+                        let b = shared.read();
                         resolve_targets(&b, &target, request_id, &req.sender, &req.message_id)
                     };
                     // serialize + enqueue outside the lock: the
@@ -678,7 +670,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
             if !delivered {
                 // DEAD LETTER: recorded with the reason, not dropped silently
                 let reply = {
-                    let mut b = shared.write().unwrap();
+                    let mut b = shared.write();
                     b.dead_ends
                         .insert(target.clone(), std::time::Instant::now());
                     b.dead_letters.push_back((
@@ -701,8 +693,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                         contexts: Vec::new(),
                     });
                     b.dedupe
-                        .lock()
-                        .unwrap()
+                        .write()
                         .remember(&req.sender, &req.message_id, reply.clone());
                     reply
                 };
@@ -754,13 +745,13 @@ fn handle_reply_view(
     // happens AFTER the guard drops, off the global lock.
     let mut target_conn = None;
     let stamped = {
-        let b = shared.read().unwrap();
+        let b = shared.read();
         // LOCAL delivery first (the hot path), then the flood map: both
         // entries are REMOVED here, so neither map can grow without bound.
         let key = (conn.id, reply.request_id);
-        let local = b.pending_local.lock().unwrap().remove(&key);
+        let local = b.pending_local.lock().remove(&key);
         let delivered_here = local.is_some();
-        let pending = local.or_else(|| b.pending_flood.lock().unwrap().remove(&key));
+        let pending = local.or_else(|| b.pending_flood.lock().remove(&key));
         let mut stamped = reply.contexts.clone();
         if delivered_here {
             stamped.insert(
@@ -778,7 +769,7 @@ fn handle_reply_view(
         // originals.
         if let Some((sender, msg_id)) = pending {
             let body_raw = reply.body.map(|raw| raw.get().to_string());
-            b.dedupe.lock().unwrap().remember_raw(
+            b.dedupe.write().remember_raw(
                 &sender,
                 &msg_id,
                 WireMessage::Reply {
@@ -834,15 +825,15 @@ fn handle(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> b
             // never on the hot path anyway.
             let mut target_conn = None;
             let reply = {
-                let b = shared.read().unwrap();
+                let b = shared.read();
                 // LOCAL delivery first (the hot path), then the flood map:
                 // both entries are REMOVED here, so neither map can grow
                 // without bound, and a flooded reply is remembered exactly
                 // like a local one (the origin must replay what it relayed).
                 let key = (conn.id, request_id);
-                let local = b.pending_local.lock().unwrap().remove(&key);
+                let local = b.pending_local.lock().remove(&key);
                 let delivered_here = local.is_some();
-                let pending = local.or_else(|| b.pending_flood.lock().unwrap().remove(&key));
+                let pending = local.or_else(|| b.pending_flood.lock().remove(&key));
                 let mut stamped = reply_contexts;
                 if delivered_here {
                     stamped.insert(
@@ -863,10 +854,7 @@ fn handle(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> b
                 // that caused it, using the (connection, request_id) the
                 // broker handed out
                 if let Some((sender, msg_id)) = pending {
-                    b.dedupe
-                        .lock()
-                        .unwrap()
-                        .remember(&sender, &msg_id, reply.clone());
+                    b.dedupe.write().remember(&sender, &msg_id, reply.clone());
                 }
                 // a reply travels to the envelope's recipient: no session
                 // state, no request-id bookkeeping
@@ -885,7 +873,7 @@ fn handle(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> b
         WireMessage::LocateReply { .. } => true,
 
         WireMessage::LocateRequest { request_id, target } => {
-            let b = shared.read().unwrap();
+            let b = shared.read();
             let known = b.urn == target || b.local.contains_key(&target);
             let reply = if known {
                 WireMessage::LocateReply {
@@ -928,7 +916,7 @@ fn handle(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, msg: WireMessage) -> b
             // fleet converges on one contract; the contexts (the signed
             // identity) travel with it
             let msg = WireMessage::SchemaSync { idl, contexts };
-            let local: Vec<Arc<Conn>> = shared.read().unwrap().local.values().cloned().collect();
+            let local: Vec<Arc<Conn>> = shared.read().local.values().cloned().collect();
             for c in local {
                 let _ = Broker::send_to(&c, &msg);
             }
@@ -961,8 +949,7 @@ impl Broker {
         let now = std::time::Instant::now();
         let rows: Vec<serde_json::Value> = self
             .dedupe
-            .lock()
-            .unwrap()
+            .read()
             .snapshot(now)
             .into_iter()
             .map(|(sender, msg_id, left_ms, reply)| {
@@ -1010,8 +997,7 @@ impl Broker {
                         .collect();
                     let n = restored.len();
                     self.dedupe
-                        .lock()
-                        .unwrap()
+                        .write()
                         .restore(std::time::Instant::now(), restored);
                     if n > 0 {
                         eprintln!(
