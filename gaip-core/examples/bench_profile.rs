@@ -120,6 +120,7 @@ fn main() {
     bench("serde_json outer FrameView", iters, || {
         #[derive(serde::Deserialize)]
         #[serde(bound(deserialize = "'de: 'a"))]
+        #[allow(dead_code)] // fields exist only to shape the parse under benchmark
         struct FV<'a> {
             #[serde(default)]
             request_id: u32,
@@ -149,6 +150,7 @@ fn main() {
     bench("serde_json ReplyView (outer)", iters, || {
         #[derive(serde::Deserialize)]
         #[serde(bound(deserialize = "'de: 'a"))]
+        #[allow(dead_code)] // fields exist only to shape the parse under benchmark
         struct RV<'a> {
             #[serde(default)]
             request_id: u32,

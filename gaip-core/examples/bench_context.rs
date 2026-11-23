@@ -71,7 +71,7 @@ fn main() {
         // (3 allocs, emulated) + to_vec (clones).
         let old = bench("OLD: from_vec+contains+push(3alloc)+to_vec", iters, || {
             let ctxs = wire_contexts(hops);
-            let mut cl = ContextList::from_vec(ctxs);
+            let cl = ContextList::from_vec(ctxs);
             black_box(cl.route_contains("urn:agent:gaip:broker:bX"));
             // emulate the old push_route's allocation cost (string+vec+join)
             let route_str = cl.route().join(",");
