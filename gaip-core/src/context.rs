@@ -92,6 +92,23 @@ impl ContextList {
         list
     }
 
+    /// Build from an owned list WITHOUT cloning the entries: the data
+    /// strings move into the list. Same last-write-wins dedup as
+    /// `from_vec`, half the allocations — the broker's relay path uses
+    /// this because it already owns the contexts off the wire.
+    pub fn from_owned(mut v: Vec<ServiceContext>) -> Self {
+        let mut list = Self {
+            entries: Vec::with_capacity(v.len()),
+        };
+        for c in v.drain(..) {
+            match list.find(c.id) {
+                Some(i) => list.entries[i].1 = c.data,
+                None => list.entries.push((c.id, c.data)),
+            }
+        }
+        list
+    }
+
     /// Last occurrence wins, mirroring the map this replaced.
     fn find(&self, id: u16) -> Option<usize> {
         self.entries.iter().rposition(|(i, _)| *i == id)
@@ -128,6 +145,21 @@ impl ContextList {
         v
     }
 
+    /// The sorted wire form, consuming the list: the data strings MOVE
+    /// out instead of being cloned. The broker's relay path calls this
+    /// once per request (the list is rebuilt from the wire's contexts on
+    /// every hop, so consuming it is always safe) and shares the result
+    /// across every fan-out target.
+    pub fn into_sorted_vec(mut self) -> Vec<ServiceContext> {
+        let mut v: Vec<ServiceContext> = self
+            .entries
+            .drain(..)
+            .map(|(id, data)| ServiceContext { id, data })
+            .collect();
+        v.sort_by_key(|c| c.id);
+        v
+    }
+
     pub fn trace_id(&self) -> Option<&str> {
         self.get(id::TRACE)
     }
@@ -159,17 +191,44 @@ impl ContextList {
 
     /// Append this hop to the route (bounded, so a routing loop is
     /// visible in the context instead of being invisible).
+    ///
+    /// ONE allocation: the old version built a combined string, a `Vec`
+    /// of hops, and the joined string. URNs cannot contain ',' (the
+    /// segment alphabet is `[A-Za-z0-9._-]`), so dropping the oldest hop
+    /// past the bound is a search for the 16th comma from the end.
     pub fn push_route(&mut self, hop: &str) -> &mut Self {
-        let mut route = self.get(id::ROUTE).unwrap_or("").to_string();
-        if !route.is_empty() {
-            route.push(',');
+        match self.find(id::ROUTE) {
+            None => {
+                self.set(id::ROUTE, hop);
+            }
+            Some(i) => {
+                let cur = self.entries[i].1.as_str();
+                // After appending `hop` the list would have `commas+2`
+                // hops. To keep at most 16, drop everything up to and
+                // including the (n-16)th comma from the front, which is
+                // the (15)th comma from the END when the result would
+                // exceed 16. Walk backwards counting commas; when we
+                // have seen 15 commas we are just past the 2nd hop, so
+                // everything after that comma is the last 16 hops.
+                let mut kept = cur;
+                let mut commas = 0usize;
+                for (pos, b) in cur.bytes().enumerate().rev() {
+                    if b == b',' {
+                        commas += 1;
+                        if commas == 15 {
+                            kept = &cur[pos + 1..];
+                            break;
+                        }
+                    }
+                }
+                let mut s = String::with_capacity(kept.len() + 1 + hop.len());
+                s.push_str(kept);
+                s.push(',');
+                s.push_str(hop);
+                self.entries[i].1 = s;
+            }
         }
-        route.push_str(hop);
-        // keep the last 16 hops: enough to spot a loop, bounded enough
-        // that the header cannot grow without limit
-        let hops: Vec<&str> = route.split(',').collect();
-        let start = hops.len().saturating_sub(16);
-        self.set(id::ROUTE, hops[start..].join(","))
+        self
     }
 
     pub fn route(&self) -> Vec<&str> {

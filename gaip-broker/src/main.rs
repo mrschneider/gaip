@@ -34,7 +34,7 @@ use gaip_core::flow::{FlowError, Outbox};
 use gaip_core::message::{ReplyStatus, SystemMinor, WireMessage};
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -55,13 +55,17 @@ type PendingKey = (u64, u32);
 /// (sender, message_id) of the request that produced the pending reply.
 type PendingEntry = (String, String);
 /// Forwarded requests awaiting their reply, keyed by the connection the
-/// reply will arrive on.
-type PendingMap = BTreeMap<PendingKey, PendingEntry>;
+/// reply will arrive on. `HashMap` (not `BTreeMap`): the key is a
+/// (connection id, request id) pair the reply matches exactly — ordering
+/// is never observed, and the hot path wants O(1) probes, not O(log n).
+type PendingMap = HashMap<PendingKey, PendingEntry>;
 
 struct Broker {
     urn: String,
-    /// participants (and peers) registered on this broker, by URN
-    local: BTreeMap<String, Arc<Conn>>,
+    /// participants (and peers) registered on this broker, by URN.
+    /// `HashMap`: the lookup is an exact-key probe on every relayed
+    /// request under the global lock — O(1), not O(log n).
+    local: HashMap<String, Arc<Conn>>,
     /// peer brokers (their connections are entries in `local` too)
     peers: Vec<Arc<Conn>>,
     /// exactly-once window. A `RwLock`, not a `Mutex`: the hot path is a
@@ -80,7 +84,7 @@ struct Broker {
     /// targets whose last delivery attempt died: skip re-flooding for a
     /// short window (the participant may still appear, so the window is
     /// short and the refusal retryable)
-    dead_ends: BTreeMap<String, std::time::Instant>,
+    dead_ends: HashMap<String, std::time::Instant>,
     /// the last dead letters: a relay that died, with the reason
     dead_letters: std::collections::VecDeque<(u128, String, String, String)>,
     retries: u32,
@@ -88,7 +92,7 @@ struct Broker {
     /// failover endpoints a participant advertised (FAILOVER context):
     /// when the primary is unreachable the broker answers OBJECT_FORWARD
     /// with the alternates, so the reference survives a crash
-    failovers: BTreeMap<String, Vec<String>>,
+    failovers: HashMap<String, Vec<String>>,
     /// persisted bindings: the registry survives a broker restart
     registry_path: Option<PathBuf>,
     /// graceful shutdown: set by the signal handler, checked by the
@@ -216,16 +220,16 @@ fn main() {
     let next_conn = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let broker = Arc::new(RwLock::new(Broker {
         urn,
-        local: BTreeMap::new(),
+        local: HashMap::new(),
         peers: Vec::new(),
         dedupe: RwLock::new(DedupeCache::new(4096, Duration::from_secs(120))),
-        pending_local: Mutex::new(BTreeMap::new()),
-        pending_flood: Mutex::new(BTreeMap::new()),
-        dead_ends: BTreeMap::new(),
+        pending_local: Mutex::new(HashMap::new()),
+        pending_flood: Mutex::new(HashMap::new()),
+        dead_ends: HashMap::new(),
         dead_letters: std::collections::VecDeque::new(),
         retries,
         backoff_ms,
-        failovers: BTreeMap::new(),
+        failovers: HashMap::new(),
         registry_path: registry_path.clone(),
         draining: std::sync::atomic::AtomicBool::new(false),
         state_path: state_path.clone(),
@@ -463,13 +467,18 @@ impl ForwardBody<'_> {
 
 fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'_>) -> bool {
     let request_id = req.request_id;
-    let contexts = req.contexts;
-    // register the participant by the URN it uses
-    let registered_new = conn.urn.lock().is_none();
-    if registered_new {
-        *conn.urn.lock() = Some(req.sender.clone());
-    }
-    let mut ctx = ContextList::from_vec(contexts);
+    // register the participant by the URN it uses — ONE lock acquisition
+    let registered_new = {
+        let mut urn = conn.urn.lock();
+        let is_new = urn.is_none();
+        if is_new {
+            *urn = Some(req.sender.clone());
+        }
+        is_new
+    };
+    // `from_owned`: the contexts arrive as an owned `Vec` off the wire;
+    // the data strings MOVE into the list instead of being cloned.
+    let mut ctx = ContextList::from_owned(req.contexts);
     if registered_new {
         let mut b = shared.write();
         b.local.insert(req.sender.clone(), conn.clone());
@@ -490,7 +499,6 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
         }
         eprintln!("[broker] {} registered", req.sender);
     }
-    let target = req.recipient.clone();
 
     // ONE critical section for the whole decision, under the
     // broker's READ lock: route check, exactly-once lookup,
@@ -512,8 +520,10 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
     }
     let decision = {
         let b = shared.read();
-        let own = b.urn.clone();
-        if ctx.route_contains(&own) {
+        // `&b.urn` — a reference, not a clone: the route check and
+        // `push_route` both take `&str`.
+        let own = &b.urn;
+        if ctx.route_contains(own) {
             Decision::Loop(WireMessage::Reply {
                 request_id,
                 status: ReplyStatus::system(
@@ -524,7 +534,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                 contexts: Vec::new(),
             })
         } else {
-            ctx.push_route(&own);
+            ctx.push_route(own);
             // exactly-once effect: replay the reply of a completed
             // exchange. The probe runs FIRST, into a local, so the
             // lock guard is released before the else-chain: a guard
@@ -569,7 +579,7 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                     Decision::Forward {
                         conns: resolve_targets(
                             &b,
-                            &target,
+                            &req.recipient,
                             request_id,
                             &req.sender,
                             &req.message_id,
@@ -586,13 +596,14 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
             // later is found on the next attempt.
             else if b
                 .dead_ends
-                .get(&target)
+                .get(&req.recipient)
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
             {
                 let refusal = ReplyStatus::system(
                     SystemMinor::ObjectNotExist,
                     format!(
-                        "{target} was recently unreachable; retry after the negative-cache window"
+                        "{} was recently unreachable; retry after the negative-cache window",
+                        req.recipient
                     ),
                 );
                 b.dedupe
@@ -606,7 +617,13 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                 })
             } else {
                 Decision::Forward {
-                    conns: resolve_targets(&b, &target, request_id, &req.sender, &req.message_id),
+                    conns: resolve_targets(
+                        &b,
+                        &req.recipient,
+                        request_id,
+                        &req.sender,
+                        &req.message_id,
+                    ),
                     retries: b.retries,
                     backoff: b.backoff_ms,
                 }
@@ -632,7 +649,10 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
             // change, the envelope bytes ride through untouched.
             // ONE allocation for the whole fan-out: every target
             // queues a reference to the same bytes.
-            let fwd: std::sync::Arc<[u8]> = match req.fwd.encode(request_id, &ctx.to_vec()) {
+            // `into_sorted_vec`: the context strings MOVE out of
+            // the list instead of being cloned for the encode.
+            let sorted = ctx.into_sorted_vec();
+            let fwd: std::sync::Arc<[u8]> = match req.fwd.encode(request_id, &sorted) {
                 Ok(bytes) => bytes.into(),
                 Err(e) => {
                     // Adding a hop pushed the frame over MAX_FRAME.
@@ -653,7 +673,13 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                     std::thread::sleep(Duration::from_millis(backoff * (attempt as u64 + 1)));
                     let conns = {
                         let b = shared.read();
-                        resolve_targets(&b, &target, request_id, &req.sender, &req.message_id)
+                        resolve_targets(
+                            &b,
+                            &req.recipient,
+                            request_id,
+                            &req.sender,
+                            &req.message_id,
+                        )
                     };
                     // serialize + enqueue outside the lock: the
                     // encode of the forwarded request is the
@@ -672,22 +698,25 @@ fn handle_request(shared: &Arc<RwLock<Broker>>, conn: &Arc<Conn>, req: ReqMeta<'
                 let reply = {
                     let mut b = shared.write();
                     b.dead_ends
-                        .insert(target.clone(), std::time::Instant::now());
+                        .insert(req.recipient.clone(), std::time::Instant::now());
                     b.dead_letters.push_back((
                         gaip_core::context::now_ms(),
                         req.sender.clone(),
-                        target.clone(),
+                        req.recipient.clone(),
                         "no reachable broker or participant".to_string(),
                     ));
                     while b.dead_letters.len() > 256 {
                         b.dead_letters.pop_front();
                     }
-                    b.journal_dead_letter(&req.sender, &target);
+                    b.journal_dead_letter(&req.sender, &req.recipient);
                     let reply = Arc::new(WireMessage::Reply {
                         request_id,
                         status: ReplyStatus::system(
                             SystemMinor::ObjectNotExist,
-                            format!("{target} is not reachable through this broker or its peers"),
+                            format!(
+                                "{} is not reachable through this broker or its peers",
+                                req.recipient
+                            ),
                         ),
                         body: None,
                         contexts: Vec::new(),
@@ -738,13 +767,18 @@ fn handle_reply_view(
     conn: &Arc<Conn>,
     reply: &RoutedReply<'_>,
 ) -> bool {
+    // The body's wire bytes are COPIED before the critical section: a
+    // body-sized allocation must not sit in the queue of the global
+    // read lock.
+    let body_raw = reply.body.map(|raw| raw.get().to_string());
     // DELIVERED: this broker handed the request to a LOCAL participant —
     // stamp the reply so the origin knows delivery was acknowledged, not
     // assumed. READ lock: recipient resolution and the pending lookup are
-    // pure reads; only the short inner Mutexes are written, and the encode
-    // happens AFTER the guard drops, off the global lock.
+    // pure reads; only the short inner Mutexes are written, and the
+    // contexts clone and the encode happen AFTER the guard drops, off
+    // the global lock.
     let mut target_conn = None;
-    let stamped = {
+    let (delivered_here, own_urn) = {
         let b = shared.read();
         // LOCAL delivery first (the hot path), then the flood map: both
         // entries are REMOVED here, so neither map can grow without bound.
@@ -752,13 +786,6 @@ fn handle_reply_view(
         let local = b.pending_local.lock().remove(&key);
         let delivered_here = local.is_some();
         let pending = local.or_else(|| b.pending_flood.lock().remove(&key));
-        let mut stamped = reply.contexts.clone();
-        if delivered_here {
-            stamped.insert(
-                0,
-                gaip_core::ServiceContext::new(gaip_core::context::id::DELIVERED, b.urn.clone()),
-            );
-        }
         // exactly-once: remember the reply against the request that caused
         // it, using the (connection, request_id) the broker handed out.
         // The body is stored as its WIRE BYTES (`remember_raw`), not parsed
@@ -766,9 +793,19 @@ fn handle_reply_view(
         // for EVERY relayed reply just to cache it, then re-serialized it
         // again on the rare replay. The raw bytes are spliced back on
         // replay via `encode_reply_view`; the forwarded bytes below stay the
-        // originals.
+        // originals. The stamped contexts (DELIVERED) ride the stored entry
+        // so a REPLAY is byte-identical to the reply the origin first got.
         if let Some((sender, msg_id)) = pending {
-            let body_raw = reply.body.map(|raw| raw.get().to_string());
+            let mut stamped = reply.contexts.clone();
+            if delivered_here {
+                stamped.insert(
+                    0,
+                    gaip_core::ServiceContext::new(
+                        gaip_core::context::id::DELIVERED,
+                        b.urn.clone(),
+                    ),
+                );
+            }
             b.dedupe.write().remember_raw(
                 &sender,
                 &msg_id,
@@ -776,7 +813,7 @@ fn handle_reply_view(
                     request_id: reply.request_id,
                     status: reply.status.clone(),
                     body: None, // carried as raw bytes; materialized on replay
-                    contexts: stamped.clone(),
+                    contexts: stamped,
                 },
                 body_raw,
             );
@@ -786,8 +823,17 @@ fn handle_reply_view(
         if let Some(target) = &reply.recipient {
             target_conn = b.conn_for(target);
         }
-        stamped
+        (delivered_here, b.urn.clone())
     };
+    // stamp + encode OFF the global lock: the contexts clone is a
+    // per-reply allocation that used to sit inside the critical section
+    let mut stamped = reply.contexts.clone();
+    if delivered_here {
+        stamped.insert(
+            0,
+            gaip_core::ServiceContext::new(gaip_core::context::id::DELIVERED, own_urn),
+        );
+    }
     if let Some(c) = target_conn {
         let bytes = encode_reply_view(reply.request_id, &reply.status, &stamped, reply.body).ok();
         if let Some(bytes) = bytes {
